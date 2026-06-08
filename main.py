@@ -1,6 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Request
-from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Request, Header
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date, update
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -8,10 +7,10 @@ from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from google.cloud import storage as gcs_storage
 import uvicorn
 import os
 import uuid
-import shutil
 import re
 import json
 from datetime import date, datetime, timedelta
@@ -32,7 +31,13 @@ SQLALCHEMY_DATABASE_URL = (
     f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME')}"
 )
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    pool_size=3,
+    max_overflow=5,
+    pool_timeout=30,
+    pool_recycle=1800,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -107,11 +112,14 @@ async def limit_upload_size(request: Request, call_next):
         raise HTTPException(status_code=413, detail="Request entity too large")
     return await call_next(request)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PHYSICAL_DIR = os.path.join(BASE_DIR, "static", "thumbnails")
-os.makedirs(PHYSICAL_DIR, exist_ok=True)
+GCS_BUCKET = os.getenv("GCS_BUCKET_NAME", "nemoneai-thumbnails")
 
-app.mount("/thumbnails", StaticFiles(directory=PHYSICAL_DIR), name="thumbnails")
+def upload_to_gcs(file_obj, filename: str) -> str:
+    client = gcs_storage.Client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(filename)
+    blob.upload_from_file(file_obj)
+    return f"https://storage.googleapis.com/{GCS_BUCKET}/{filename}"
 
 # Nginx에서 CORS(Access-Control-Allow-Origin: *)를 이미 추가하고 있으므로, 
 # 백엔드에서는 중복 추가를 방지하기 위해 CORSMiddleware를 사용하지 않습니다.
@@ -128,26 +136,64 @@ def get_db():
     finally:
         db.close()
 
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY")
+NEWS_SECRET_KEY = os.getenv("NEWS_SECRET_KEY")
+
+async def verify_admin(x_admin_secret: Optional[str] = Header(None)):
+    if not ADMIN_SECRET_KEY or x_admin_secret != ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
 # --- API 엔드포인트 (오직 Form 데이터만 받는 안정적인 구조) ---
 
 @app.get("/posts")
-def get_posts(category: Optional[str] = None, db: Session = Depends(get_db)):
+def get_posts(category: Optional[str] = None, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     query = db.query(Post)
     if category:
         query = query.filter(Post.category == category)
-    return query.order_by(Post.id.desc()).all()
+    total = query.count()
+    posts = query.order_by(Post.id.desc()).offset(skip).limit(limit).all()
+    def summarize(post):
+        d = {c.name: getattr(post, c.name) for c in post.__table__.columns}
+        d["body_text"] = re.sub(r'<[^>]+>', '', d.get("body_text") or "")[:200]
+        return d
+    return {"total": total, "posts": [summarize(p) for p in posts]}
 
 @app.get("/posts/ranking")
 def get_top_ranking(db: Session = Depends(get_db)):
-    posts = db.query(Post).all()
-    ranking_data = []
-    for p in posts:
-        comment_count = db.query(Comment).filter(Comment.post_id == p.id).count()
-        like_count = db.query(Like).filter(Like.post_id == p.id).count()
-        score = (p.view_count or 0) + (comment_count * 2) + (like_count * 3)
-        ranking_data.append({"id": p.id, "title": p.title, "category": p.category, "score": score, "created_at": p.created_at})
-    ranking_data.sort(key=lambda x: (x["score"], x["created_at"]), reverse=True)
-    return ranking_data[:3]
+    comment_counts = (
+        db.query(Comment.post_id, func.count(Comment.id).label("comment_count"))
+        .group_by(Comment.post_id)
+        .subquery()
+    )
+    like_counts = (
+        db.query(Like.post_id, func.count(Like.id).label("like_count"))
+        .group_by(Like.post_id)
+        .subquery()
+    )
+    score_expr = (
+        func.coalesce(Post.view_count, 0)
+        + func.coalesce(comment_counts.c.comment_count, 0) * 2
+        + func.coalesce(like_counts.c.like_count, 0) * 3
+    )
+
+    def _query(since: datetime):
+        return (
+            db.query(Post.id, Post.title, Post.category, Post.image_url, Post.created_at, score_expr.label("score"))
+            .outerjoin(comment_counts, Post.id == comment_counts.c.post_id)
+            .outerjoin(like_counts, Post.id == like_counts.c.post_id)
+            .filter(Post.created_at >= since)
+            .order_by(score_expr.desc(), Post.created_at.desc())
+            .limit(3)
+            .all()
+        )
+
+    # 최근 7일 우선, 3개 미만이면 30일로 확장
+    now = datetime.utcnow()
+    results = _query(now - timedelta(days=7))
+    if len(results) < 3:
+        results = _query(now - timedelta(days=30))
+
+    return [{"id": r.id, "title": r.title, "category": r.category, "image_url": r.image_url, "score": r.score, "created_at": r.created_at} for r in results]
 
 @app.get("/posts/{post_id}")
 def get_post(post_id: int, db: Session = Depends(get_db)):
@@ -177,17 +223,15 @@ async def create_post(
     video_url: Optional[str] = Form(""),
     tags: Optional[str] = Form(""),
     image_file: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_admin)
 ):
     try:
         image_web_url = ""
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"{uuid.uuid4()}{file_ext}"
-            save_path = os.path.join(PHYSICAL_DIR, unique_name)
-            with open(save_path, "wb") as buffer:
-                shutil.copyfileobj(image_file.file, buffer)
-            image_web_url = f"https://nemoneai.com/thumbnails/{unique_name}"
+            image_web_url = upload_to_gcs(image_file.file, unique_name)
         elif video_url:
             youtube_match = re.search(r"(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^\"&?\/\s]{11})", video_url, re.I)
             if youtube_match:
@@ -219,7 +263,8 @@ async def update_post(
     video_url: Optional[str] = Form(""),
     tags: Optional[str] = Form(""),
     image_file: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_admin)
 ):
     db_post = db.query(Post).filter(Post.id == post_id).first()
     if not db_post: raise HTTPException(status_code=404, detail="수정할 게시물을 찾을 수 없습니다.")
@@ -228,10 +273,7 @@ async def update_post(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"{uuid.uuid4()}{file_ext}"
-            save_path = os.path.join(PHYSICAL_DIR, unique_name)
-            with open(save_path, "wb") as buffer:
-                shutil.copyfileobj(image_file.file, buffer)
-            image_web_url = f"https://nemoneai.com/thumbnails/{unique_name}"
+            image_web_url = upload_to_gcs(image_file.file, unique_name)
         elif video_url:
             youtube_match = re.search(r"(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^\"&?\/\s]{11})", video_url, re.I)
             if youtube_match:
@@ -255,7 +297,7 @@ async def update_post(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/posts/{post_id}")
-def delete_post(post_id: int, db: Session = Depends(get_db)):
+def delete_post(post_id: int, db: Session = Depends(get_db), _: None = Depends(verify_admin)):
     db_post = db.query(Post).filter(Post.id == post_id).first()
     if not db_post: raise HTTPException(status_code=404, detail="삭제할 게시물을 찾을 수 없습니다.")
     db.delete(db_post)
@@ -316,22 +358,21 @@ async def log_visitor(db: Session = Depends(get_db)):
     today = date.today()
     stat = db.query(DailyStat).filter(DailyStat.date == today).first()
     if not stat:
-        stat = DailyStat(date=today, visitors=1, total_views=0)
-        db.add(stat)
-    else: stat.visitors += 1
+        db.add(DailyStat(date=today, visitors=1, total_views=0))
+    else:
+        db.execute(update(DailyStat).where(DailyStat.date == today).values(visitors=DailyStat.visitors + 1))
     db.commit()
     return {"status": "ok"}
 
 @app.post("/analytics/log-view/{post_id}")
 async def log_view(post_id: int, db: Session = Depends(get_db)):
-    post = db.query(Post).filter(Post.id == post_id).first()
-    if post: post.view_count = (post.view_count or 0) + 1
+    db.execute(update(Post).where(Post.id == post_id).values(view_count=func.coalesce(Post.view_count, 0) + 1))
     today = date.today()
     stat = db.query(DailyStat).filter(DailyStat.date == today).first()
     if not stat:
-        stat = DailyStat(date=today, visitors=0, total_views=1)
-        db.add(stat)
-    else: stat.total_views += 1
+        db.add(DailyStat(date=today, visitors=0, total_views=1))
+    else:
+        db.execute(update(DailyStat).where(DailyStat.date == today).values(total_views=DailyStat.total_views + 1))
     db.commit()
     return {"status": "ok"}
 
@@ -416,7 +457,8 @@ async def create_special(
     is_main: int = Form(0),
     tags: Optional[str] = Form(""),
     image_file: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_admin)
 ):
     try:
         image_web_url = ""
@@ -449,7 +491,8 @@ async def update_special(
     is_main: int = Form(0),
     tags: Optional[str] = Form(""),
     image_file: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_admin)
 ):
     db_special = db.query(Special).filter(Special.id == special_id).first()
     if not db_special:
@@ -477,7 +520,7 @@ async def update_special(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/specials/{special_id}")
-def delete_special(special_id: int, db: Session = Depends(get_db)):
+def delete_special(special_id: int, db: Session = Depends(get_db), _: None = Depends(verify_admin)):
     db_special = db.query(Special).filter(Special.id == special_id).first()
     if not db_special:
         raise HTTPException(status_code=404, detail="Special not found")
@@ -486,8 +529,6 @@ def delete_special(special_id: int, db: Session = Depends(get_db)):
     return {"message": "Successfully deleted", "id": special_id}
 
 # --- NEMONE NEWS 관련 API ---
-
-NEWS_SECRET_KEY = os.getenv("NEWS_SECRET_KEY", "nemone1234!")
 
 @app.get("/news")
 def get_news(skip: int = 0, limit: int = 5, db: Session = Depends(get_db)):
