@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Request, Header
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Request, Header, BackgroundTasks
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date, update
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
@@ -13,6 +13,8 @@ import os
 import uuid
 import re
 import json
+import threading
+import urllib.request
 from datetime import date, datetime, timedelta
 
 load_dotenv()
@@ -113,10 +115,13 @@ async def limit_upload_size(request: Request, call_next):
     return await call_next(request)
 
 GCS_BUCKET = os.getenv("GCS_BUCKET_NAME", "nemoneai-thumbnails")
+_gcs_client = None
 
 def upload_to_gcs(file_obj, filename: str) -> str:
-    client = gcs_storage.Client()
-    bucket = client.bucket(GCS_BUCKET)
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = gcs_storage.Client()
+    bucket = _gcs_client.bucket(GCS_BUCKET)
     blob = bucket.blob(filename)
     blob.upload_from_file(file_obj)
     return f"https://storage.googleapis.com/{GCS_BUCKET}/{filename}"
@@ -253,6 +258,14 @@ async def create_post(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+def _revalidate_post(post_id: int):
+    try:
+        secret = os.getenv("ADMIN_SECRET_KEY", "")
+        url = f"http://127.0.0.1:3000/api/revalidate?path=/posts/{post_id}&secret={secret}"
+        urllib.request.urlopen(url, timeout=3)
+    except Exception:
+        pass
+
 @app.put("/posts/{post_id}")
 async def update_post(
     post_id: int,
@@ -274,7 +287,8 @@ async def update_post(
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"{uuid.uuid4()}{file_ext}"
             image_web_url = upload_to_gcs(image_file.file, unique_name)
-        elif video_url:
+        elif video_url and not db_post.image_url:
+            # 기존 이미지가 없을 때만 자동 생성 (덮어쓰기 방지)
             youtube_match = re.search(r"(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^\"&?\/\s]{11})", video_url, re.I)
             if youtube_match:
                 video_id = youtube_match.group(1)
@@ -291,6 +305,7 @@ async def update_post(
         db_post.image_url = image_web_url
         db.commit()
         db.refresh(db_post)
+        threading.Thread(target=_revalidate_post, args=(post_id,), daemon=True).start()
         return db_post
     except Exception as e:
         db.rollback()
@@ -352,17 +367,6 @@ def get_like_status(post_id: int, user_id: Optional[str] = None, db: Session = D
     total = db.query(Like).filter(Like.post_id == post_id).count()
     liked = db.query(Like).filter(Like.post_id == post_id, Like.user_id == user_id).first() is not None if user_id else False
     return {"total": total, "user_liked": liked}
-
-@app.post("/analytics/log-visitor")
-async def log_visitor(db: Session = Depends(get_db)):
-    today = date.today()
-    stat = db.query(DailyStat).filter(DailyStat.date == today).first()
-    if not stat:
-        db.add(DailyStat(date=today, visitors=1, total_views=0))
-    else:
-        db.execute(update(DailyStat).where(DailyStat.date == today).values(visitors=DailyStat.visitors + 1))
-    db.commit()
-    return {"status": "ok"}
 
 @app.post("/analytics/log-view/{post_id}")
 async def log_view(post_id: int, db: Session = Depends(get_db)):
