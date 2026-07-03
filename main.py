@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from google.cloud import storage as gcs_storage
+from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 import os
 import uuid
@@ -163,42 +164,70 @@ def get_posts(category: Optional[str] = None, skip: int = 0, limit: int = 100, d
         return d
     return {"total": total, "posts": [summarize(p) for p in posts]}
 
-@app.get("/posts/ranking")
-def get_top_ranking(db: Session = Depends(get_db)):
-    comment_counts = (
-        db.query(Comment.post_id, func.count(Comment.id).label("comment_count"))
-        .group_by(Comment.post_id)
-        .subquery()
-    )
-    like_counts = (
-        db.query(Like.post_id, func.count(Like.id).label("like_count"))
-        .group_by(Like.post_id)
-        .subquery()
-    )
-    score_expr = (
-        func.coalesce(Post.view_count, 0)
-        + func.coalesce(comment_counts.c.comment_count, 0) * 2
-        + func.coalesce(like_counts.c.like_count, 0) * 3
-    )
+_top_ranking_cache: list = []
 
-    def _query(since: datetime):
-        return (
-            db.query(Post.id, Post.title, Post.category, Post.image_url, Post.created_at, score_expr.label("score"))
-            .outerjoin(comment_counts, Post.id == comment_counts.c.post_id)
-            .outerjoin(like_counts, Post.id == like_counts.c.post_id)
-            .filter(Post.created_at >= since)
-            .order_by(score_expr.desc(), Post.created_at.desc())
-            .limit(3)
-            .all()
+def refresh_top_ranking():
+    """주간 TOP10 랭킹 재계산 — 하루 2회(한국시간 자정/낮 12시)만 실행, 매 요청마다 재계산하지 않도록 캐싱.
+    조회수/댓글수/좋아요수를 각각 별도 필드로 보관 (어드민 TOP10 표시용) + 가중합산 score(공개 TOP3용)."""
+    global _top_ranking_cache
+    db = SessionLocal()
+    try:
+        comment_counts = (
+            db.query(Comment.post_id, func.count(Comment.id).label("comment_count"))
+            .group_by(Comment.post_id)
+            .subquery()
         )
+        like_counts = (
+            db.query(Like.post_id, func.count(Like.id).label("like_count"))
+            .group_by(Like.post_id)
+            .subquery()
+        )
+        view_count_expr = func.coalesce(Post.view_count, 0)
+        comment_count_expr = func.coalesce(comment_counts.c.comment_count, 0)
+        like_count_expr = func.coalesce(like_counts.c.like_count, 0)
+        score_expr = view_count_expr + comment_count_expr * 2 + like_count_expr * 3
 
-    # 최근 7일 우선, 3개 미만이면 30일로 확장
-    now = datetime.utcnow()
-    results = _query(now - timedelta(days=7))
-    if len(results) < 3:
-        results = _query(now - timedelta(days=30))
+        def _query(since: datetime, limit: int):
+            return (
+                db.query(
+                    Post.id, Post.title, Post.category, Post.image_url, Post.created_at,
+                    view_count_expr.label("view_count"),
+                    comment_count_expr.label("comment_count"),
+                    like_count_expr.label("like_count"),
+                    score_expr.label("score"),
+                )
+                .outerjoin(comment_counts, Post.id == comment_counts.c.post_id)
+                .outerjoin(like_counts, Post.id == like_counts.c.post_id)
+                .filter(Post.created_at >= since)
+                .order_by(score_expr.desc(), Post.created_at.desc())
+                .limit(limit)
+                .all()
+            )
 
-    return [{"id": r.id, "title": r.title, "category": r.category, "image_url": r.image_url, "score": r.score, "created_at": r.created_at} for r in results]
+        # 최근 7일 우선, 10개 미만이면 30일로 확장
+        now = datetime.utcnow()
+        results = _query(now - timedelta(days=7), 10)
+        if len(results) < 10:
+            results = _query(now - timedelta(days=30), 10)
+
+        _top_ranking_cache = [
+            {
+                "id": r.id, "title": r.title, "category": r.category, "image_url": r.image_url,
+                "created_at": r.created_at, "view_count": r.view_count,
+                "comment_count": r.comment_count, "like_count": r.like_count, "score": r.score,
+            }
+            for r in results
+        ]
+    finally:
+        db.close()
+
+@app.get("/posts/ranking")
+def get_top_ranking():
+    return _top_ranking_cache[:3]
+
+@app.get("/admin/ranking/top10", dependencies=[Depends(verify_admin)])
+def get_admin_top_ranking():
+    return _top_ranking_cache
 
 @app.get("/posts/{post_id}")
 def get_post(post_id: int, db: Session = Depends(get_db)):
@@ -469,10 +498,7 @@ async def create_special(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"special_{uuid.uuid4()}{file_ext}"
-            save_path = os.path.join(PHYSICAL_DIR, unique_name)
-            with open(save_path, "wb") as buffer:
-                shutil.copyfileobj(image_file.file, buffer)
-            image_web_url = f"https://nemoneai.com/thumbnails/{unique_name}"
+            image_web_url = upload_to_gcs(image_file.file, unique_name)
 
         db_special = Special(
             title=title, description=description, post_ids=post_ids,
@@ -506,10 +532,7 @@ async def update_special(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"special_{uuid.uuid4()}{file_ext}"
-            save_path = os.path.join(PHYSICAL_DIR, unique_name)
-            with open(save_path, "wb") as buffer:
-                shutil.copyfileobj(image_file.file, buffer)
-            db_special.bg_image_url = f"https://nemoneai.com/thumbnails/{unique_name}"
+            db_special.bg_image_url = upload_to_gcs(image_file.file, unique_name)
 
         db_special.title = title
         db_special.description = description
@@ -571,6 +594,14 @@ def delete_news(news_id: int, request: Request, db: Session = Depends(get_db)):
     db.delete(db_news)
     db.commit()
     return {"message": "Successfully deleted", "id": news_id}
+
+refresh_top_ranking()
+
+# 서버는 UTC 기준 — 한국시간(KST=UTC+9) 자정(00:00)/낮 12시(12:00)에 맞춰 UTC 15:00, 03:00에 실행
+ranking_scheduler = BackgroundScheduler()
+ranking_scheduler.add_job(refresh_top_ranking, 'cron', hour=15, minute=5, id='ranking_kst_midnight')
+ranking_scheduler.add_job(refresh_top_ranking, 'cron', hour=3, minute=5, id='ranking_kst_noon')
+ranking_scheduler.start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
