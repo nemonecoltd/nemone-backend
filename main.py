@@ -103,6 +103,14 @@ class DailyStat(Base):
     visitors = Column(Integer, default=0)
     total_views = Column(Integer, default=0)
 
+class PostView(Base):
+    """조회 발생 시각 로그 — 주간 랭킹에서 '최근 N일 조회수'를 계산하기 위함.
+    Post.view_count(전체 누적)와 별개로 오늘부터 쌓임 — 과거 조회는 소급 불가."""
+    __tablename__ = "post_views"
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), index=True)
+    viewed_at = Column(DateTime, default=func.now(), index=True)
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -168,26 +176,39 @@ _top_ranking_cache: list = []
 
 def refresh_top_ranking():
     """주간 TOP10 랭킹 재계산 — 하루 2회(한국시간 자정/낮 12시)만 실행, 매 요청마다 재계산하지 않도록 캐싱.
-    조회수/댓글수/좋아요수를 각각 별도 필드로 보관 (어드민 TOP10 표시용) + 가중합산 score(공개 TOP3용)."""
+    조회수/댓글수/좋아요수를 각각 별도 필드로 보관 (어드민 TOP10 표시용) + 가중합산 score(공개 TOP3용).
+
+    주의: 예전엔 Post.created_at(게시일)로 후보를 걸러서 "최근에 쓴 글"만 후보가 됐고, 그 안에서도
+    좋아요/댓글/조회수는 전체기간 누적이라 오래된 글이 게시일 창 안에 있으면 계속 상위권을 차지했음.
+    지금은 좋아요/댓글/조회수 자체를 각각 최근 N일로 스코프해서, 게시일과 무관하게
+    "이번 주에 실제로 인기 있는 글"을 잡도록 수정."""
     global _top_ranking_cache
     db = SessionLocal()
     try:
-        comment_counts = (
-            db.query(Comment.post_id, func.count(Comment.id).label("comment_count"))
-            .group_by(Comment.post_id)
-            .subquery()
-        )
-        like_counts = (
-            db.query(Like.post_id, func.count(Like.id).label("like_count"))
-            .group_by(Like.post_id)
-            .subquery()
-        )
-        view_count_expr = func.coalesce(Post.view_count, 0)
-        comment_count_expr = func.coalesce(comment_counts.c.comment_count, 0)
-        like_count_expr = func.coalesce(like_counts.c.like_count, 0)
-        score_expr = view_count_expr + comment_count_expr * 2 + like_count_expr * 3
-
         def _query(since: datetime, limit: int):
+            view_counts = (
+                db.query(PostView.post_id, func.count(PostView.id).label("view_count"))
+                .filter(PostView.viewed_at >= since)
+                .group_by(PostView.post_id)
+                .subquery()
+            )
+            comment_counts = (
+                db.query(Comment.post_id, func.count(Comment.id).label("comment_count"))
+                .filter(Comment.created_at >= since)
+                .group_by(Comment.post_id)
+                .subquery()
+            )
+            like_counts = (
+                db.query(Like.post_id, func.count(Like.id).label("like_count"))
+                .filter(Like.created_at >= since)
+                .group_by(Like.post_id)
+                .subquery()
+            )
+            view_count_expr = func.coalesce(view_counts.c.view_count, 0)
+            comment_count_expr = func.coalesce(comment_counts.c.comment_count, 0)
+            like_count_expr = func.coalesce(like_counts.c.like_count, 0)
+            score_expr = view_count_expr + comment_count_expr * 2 + like_count_expr * 3
+
             return (
                 db.query(
                     Post.id, Post.title, Post.category, Post.image_url, Post.created_at,
@@ -196,15 +217,16 @@ def refresh_top_ranking():
                     like_count_expr.label("like_count"),
                     score_expr.label("score"),
                 )
+                .outerjoin(view_counts, Post.id == view_counts.c.post_id)
                 .outerjoin(comment_counts, Post.id == comment_counts.c.post_id)
                 .outerjoin(like_counts, Post.id == like_counts.c.post_id)
-                .filter(Post.created_at >= since)
+                .filter(score_expr > 0)
                 .order_by(score_expr.desc(), Post.created_at.desc())
                 .limit(limit)
                 .all()
             )
 
-        # 최근 7일 우선, 10개 미만이면 30일로 확장
+        # 최근 7일 우선, 10개 미만이면 30일로 확장 (post_views는 도입 시점부터 쌓이므로 초기엔 30일 폴백이 자주 걸릴 수 있음)
         now = datetime.utcnow()
         results = _query(now - timedelta(days=7), 10)
         if len(results) < 10:
@@ -400,6 +422,7 @@ def get_like_status(post_id: int, user_id: Optional[str] = None, db: Session = D
 @app.post("/analytics/log-view/{post_id}")
 async def log_view(post_id: int, db: Session = Depends(get_db)):
     db.execute(update(Post).where(Post.id == post_id).values(view_count=func.coalesce(Post.view_count, 0) + 1))
+    db.add(PostView(post_id=post_id))  # 주간 랭킹의 "최근 N일 조회수" 계산용 로그
     today = date.today()
     stat = db.query(DailyStat).filter(DailyStat.date == today).first()
     if not stat:
