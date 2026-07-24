@@ -127,12 +127,35 @@ GCS_BUCKET = os.getenv("GCS_BUCKET_NAME", "nemoneai-thumbnails")
 _gcs_client = None
 
 def upload_to_gcs(file_obj, filename: str) -> str:
+    """썸네일 업로드 — 원본을 그대로 올리면 용량이 커서(수백KB~) Googlebot 크롤링 시 렌더링
+    타임아웃의 원인이 될 수 있어, 리사이즈+WebP 압축 후 업로드(now_back의 이미지 처리 방식과 동일).
+    PIL로 못 여는 파일(원본이 이미 손상됐거나 특수 포맷)이면 원본 그대로 업로드해 업로드 자체는 실패하지 않게 함."""
     global _gcs_client
     if _gcs_client is None:
         _gcs_client = gcs_storage.Client()
     bucket = _gcs_client.bucket(GCS_BUCKET)
+
+    raw_bytes = file_obj.read()
+    try:
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(raw_bytes))
+        img = img.convert("RGB")
+        max_width = 1600
+        if img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)))
+        buf = _io.BytesIO()
+        img.save(buf, format="WEBP", quality=85)
+        upload_bytes = buf.getvalue()
+        filename = os.path.splitext(filename)[0] + ".webp"
+        content_type = "image/webp"
+    except Exception:
+        upload_bytes = raw_bytes
+        content_type = None
+
     blob = bucket.blob(filename)
-    blob.upload_from_file(file_obj)
+    blob.upload_from_string(upload_bytes, content_type=content_type)
     return f"https://storage.googleapis.com/{GCS_BUCKET}/{filename}"
 
 # Nginx에서 CORS(Access-Control-Allow-Origin: *)를 이미 추가하고 있으므로, 
@@ -314,6 +337,17 @@ def _revalidate_post(post_id: int):
         secret = os.getenv("ADMIN_SECRET_KEY", "")
         url = f"http://127.0.0.1:3000/api/revalidate?path=/posts/{post_id}&secret={secret}"
         urllib.request.urlopen(url, timeout=3)
+    except Exception:
+        pass
+
+def _revalidate_special(special_id: Optional[int] = None):
+    """스페셜 생성/수정/삭제 시 목록(/special)과 해당 상세 페이지 ISR 캐시 즉시 무효화.
+    기존엔 이 갱신 훅이 없어 revalidate=3600(1시간) 시간 경과 전까지 새 스페셜이 목록에 안 보이던 문제."""
+    try:
+        secret = os.getenv("ADMIN_SECRET_KEY", "")
+        urllib.request.urlopen(f"http://127.0.0.1:3000/api/revalidate?path=/special&secret={secret}", timeout=3)
+        if special_id:
+            urllib.request.urlopen(f"http://127.0.0.1:3000/api/revalidate?path=/special/{special_id}&secret={secret}", timeout=3)
     except Exception:
         pass
 
@@ -530,6 +564,7 @@ async def create_special(
         db.add(db_special)
         db.commit()
         db.refresh(db_special)
+        threading.Thread(target=_revalidate_special, args=(db_special.id,), daemon=True).start()
         return db_special
     except Exception as e:
         db.rollback()
@@ -564,6 +599,7 @@ async def update_special(
         db_special.tags = tags
         db.commit()
         db.refresh(db_special)
+        threading.Thread(target=_revalidate_special, args=(special_id,), daemon=True).start()
         return db_special
     except Exception as e:
         db.rollback()
@@ -576,6 +612,7 @@ def delete_special(special_id: int, db: Session = Depends(get_db), _: None = Dep
         raise HTTPException(status_code=404, detail="Special not found")
     db.delete(db_special)
     db.commit()
+    threading.Thread(target=_revalidate_special, daemon=True).start()
     return {"message": "Successfully deleted", "id": special_id}
 
 # --- NEMONE NEWS 관련 API ---
