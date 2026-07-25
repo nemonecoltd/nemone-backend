@@ -329,6 +329,7 @@ async def create_post(
         db.add(db_post)
         db.commit()
         db.refresh(db_post)
+        threading.Thread(target=_revalidate_post, args=(db_post.id,), daemon=True).start()
         return db_post
     except Exception as e:
         db.rollback()
