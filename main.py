@@ -15,6 +15,7 @@ import uuid
 import re
 import json
 import threading
+import asyncio
 import urllib.request
 from datetime import date, datetime, timedelta
 
@@ -40,6 +41,7 @@ engine = create_engine(
     max_overflow=5,
     pool_timeout=30,
     pool_recycle=1800,
+    pool_pre_ping=True,  # 커넥션 재사용 전 헬스체크 — 없으면 끊긴 커넥션을 그대로 쓰다 "server closed the connection unexpectedly"로 요청이 실패함
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -310,7 +312,7 @@ async def create_post(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"{uuid.uuid4()}{file_ext}"
-            image_web_url = upload_to_gcs(image_file.file, unique_name)
+            image_web_url = await asyncio.to_thread(upload_to_gcs, image_file.file, unique_name)
         elif video_url:
             youtube_match = re.search(r"(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^\"&?\/\s]{11})", video_url, re.I)
             if youtube_match:
@@ -371,7 +373,7 @@ async def update_post(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"{uuid.uuid4()}{file_ext}"
-            image_web_url = upload_to_gcs(image_file.file, unique_name)
+            image_web_url = await asyncio.to_thread(upload_to_gcs, image_file.file, unique_name)
         elif video_url and not db_post.image_url:
             # 기존 이미지가 없을 때만 자동 생성 (덮어쓰기 방지)
             youtube_match = re.search(r"(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^\"&?\/\s]{11})", video_url, re.I)
@@ -555,7 +557,7 @@ async def create_special(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"special_{uuid.uuid4()}{file_ext}"
-            image_web_url = upload_to_gcs(image_file.file, unique_name)
+            image_web_url = await asyncio.to_thread(upload_to_gcs, image_file.file, unique_name)
 
         db_special = Special(
             title=title, description=description, post_ids=post_ids,
@@ -590,7 +592,7 @@ async def update_special(
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
             unique_name = f"special_{uuid.uuid4()}{file_ext}"
-            db_special.bg_image_url = upload_to_gcs(image_file.file, unique_name)
+            db_special.bg_image_url = await asyncio.to_thread(upload_to_gcs, image_file.file, unique_name)
 
         db_special.title = title
         db_special.description = description
