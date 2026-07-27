@@ -256,3 +256,15 @@ pm2 logs backend --lines 20
   [{"origin": ["*"], "method": ["GET", "HEAD"], "responseHeader": ["Content-Type"], "maxAgeSeconds": 3600}]
   ```
 - 적용 후 `curl` 재검증(캐시 우회) — `access-control-allow-origin: *` 정상 확인, OPTIONS 프리플라이트도 `GET,HEAD` 허용으로 정상 응답
+
+---
+
+## 2026-07-27 작업 내역 — 히어로 타이틀 반응형 폰트 개선 + 배포 인프라 상태 재확인
+
+### 1. 히어로 타이틀 폰트 fluid typography로 교체
+- `frontend/src/app/(main)/HomeContent.tsx`의 히어로 `h2`가 `text-4xl md:text-7xl lg:text-8xl`(768px/1024px 계단식)이라, 768px 미만 전 구간(320px 작은 폰부터 767px까지)이 전부 고정 36px — 좁은 화면일수록 상대적으로 과도하게 커 보이던 원인
+- `text-[clamp(1.75rem,7vw+0.3rem,6rem)]`로 교체해 화면 폭에 비례해 연속적으로 스케일되도록 수정
+
+### 2. 배포 과정에서 발견한 인프라 정보 미갱신 2건
+- 로컬 matmatch 백엔드가 일요일부터 계속 떠있던 프로세스라, `.env`가 msm-db(34.50.63.89)로 이미 전환된 뒤에도 프로세스 메모리엔 마이그레이션 전 구 Cloud SQL IP(34.64.236.78, 이미 정지됨)가 남아있어 `/posts?limit=10000` 등 SSG 데이터 페치가 전부 타임아웃 — 프로세스 재시작으로 해결(env는 프로세스 시작 시 1회만 로드되므로 `.env` 변경 후 재기동 필요)
+- 프론트 배포 시도 시 로컬 메모리 절차가 구 서버(`nemonecoltd@34.64.98.113`, 이미 정지)를 가리키고 있었음 — msm VM(`ubuntu@34.64.111.65`)에서 pm2 프로세스 실제 cwd(`~/apps/matmatch_frontend`) 확인 후 정상 배포, 관련 로컬 배포 메모리 갱신
