@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Request, Header, BackgroundTasks
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date, update
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date, update, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -185,10 +185,17 @@ async def verify_admin(x_admin_secret: Optional[str] = Header(None)):
 # --- API 엔드포인트 (오직 Form 데이터만 받는 안정적인 구조) ---
 
 @app.get("/posts")
-def get_posts(category: Optional[str] = None, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def get_posts(category: Optional[str] = None, q: Optional[str] = None, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     query = db.query(Post)
     if category:
         query = query.filter(Post.category == category)
+    if q:
+        q = q.strip()
+        pattern = f"%{q}%"
+        conditions = [Post.title.ilike(pattern), Post.body_text.ilike(pattern), Post.category.ilike(pattern), Post.tags.ilike(pattern)]
+        if q.lstrip("#").isdigit():
+            conditions.append(Post.id == int(q.lstrip("#")))
+        query = query.filter(or_(*conditions))
     total = query.count()
     posts = query.order_by(Post.id.desc()).offset(skip).limit(limit).all()
     def summarize(post):
