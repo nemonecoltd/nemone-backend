@@ -294,8 +294,8 @@ def get_adjacent_posts(post_id: int, db: Session = Depends(get_db)):
     current = db.query(Post).filter(Post.id == post_id).first()
     if not current: raise HTTPException(status_code=404, detail="Post not found")
     
-    prev_post = db.query(Post).filter(Post.id < post_id).order_by(Post.id.desc()).first()
-    next_post = db.query(Post).filter(Post.id > post_id).order_by(Post.id.asc()).first()
+    prev_post = db.query(Post).filter(Post.id < post_id, Post.category == current.category).order_by(Post.id.desc()).first()
+    next_post = db.query(Post).filter(Post.id > post_id, Post.category == current.category).order_by(Post.id.asc()).first()
     
     return {
         "prev": {"id": prev_post.id, "title": prev_post.title, "category": prev_post.category} if prev_post else None,
