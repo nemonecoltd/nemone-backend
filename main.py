@@ -651,6 +651,28 @@ def create_news(
     db.refresh(db_news)
     return db_news
 
+@app.put("/news/{news_id}")
+def update_news(
+    news_id: int,
+    request: Request,
+    title: str = Form(...),
+    content: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    secret = request.headers.get("x-news-secret")
+    if secret != NEWS_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    db_news = db.query(NemoneNews).filter(NemoneNews.id == news_id).first()
+    if not db_news:
+        raise HTTPException(status_code=404, detail="News not found")
+
+    db_news.title = title
+    db_news.content = content
+    db.commit()
+    db.refresh(db_news)
+    return db_news
+
 @app.delete("/news/{news_id}")
 def delete_news(news_id: int, request: Request, db: Session = Depends(get_db)):
     secret = request.headers.get("x-news-secret")
