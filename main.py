@@ -693,6 +693,22 @@ refresh_top_ranking()
 ranking_scheduler = BackgroundScheduler()
 ranking_scheduler.add_job(refresh_top_ranking, 'cron', hour=15, minute=5, id='ranking_kst_midnight')
 ranking_scheduler.add_job(refresh_top_ranking, 'cron', hour=3, minute=5, id='ranking_kst_noon')
+
+# GA4 리포트(국가별 제외, now_back과 동일 패턴) — KST 6/9/12/15/18/21/23:59시 일간 +
+# 매주 월요일 07:00 주간 + 매월 1일 10:00 월간. UTC = KST-9h.
+# 로컬 개발서버에서 실수로 같이 발송되는 걸 막기 위해 TELEGRAM_BOT_TOKEN/CHAT_ID를
+# 프로덕션 .env에만 넣어둠(로컬은 미설정 → notification.send_alert가 조용히 스킵).
+import ga4_service
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=21, minute=20, id='ga4_kst_0600')
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=0, minute=20, id='ga4_kst_0900')
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=3, minute=20, id='ga4_kst_1200')
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=6, minute=20, id='ga4_kst_1500')
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=9, minute=20, id='ga4_kst_1800')
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=12, minute=20, id='ga4_kst_2100')
+ranking_scheduler.add_job(ga4_service.send_ga4_report, 'cron', hour=14, minute=59, id='ga4_kst_2359')
+ranking_scheduler.add_job(ga4_service.send_weekly_ga4_report, 'cron', day_of_week='sun', hour=22, minute=10, id='ga4_weekly_kst_mon_0700')
+ranking_scheduler.add_job(ga4_service.send_monthly_ga4_report, 'cron', day=1, hour=1, minute=10, id='ga4_monthly_kst_1st_1000')
+
 ranking_scheduler.start()
 
 if __name__ == "__main__":
