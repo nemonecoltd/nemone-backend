@@ -463,6 +463,31 @@ def get_like_status(post_id: int, user_id: Optional[str] = None, db: Session = D
     liked = db.query(Like).filter(Like.post_id == post_id, Like.user_id == user_id).first() is not None if user_id else False
     return {"total": total, "user_liked": liked}
 
+@app.get("/users/{user_id}/likes")
+def get_user_likes(user_id: str, db: Session = Depends(get_db)):
+    """내가 찜한 기사 목록 — 마이페이지용. 찜은 예전부터 쌓이고 있었지만
+    조회할 방법이 없어 볼 수 없었던 데이터라, 목록 API만 추가(2026-08-28)."""
+    likes = db.query(Like).filter(Like.user_id == user_id).order_by(Like.created_at.desc()).all()
+    post_ids = [l.post_id for l in likes]
+    if not post_ids:
+        return {"posts": []}
+
+    posts = db.query(Post).filter(Post.id.in_(post_ids)).all()
+    # 찜한 순서(최신순) 유지 — IN 절 결과는 순서를 보장하지 않음
+    order = {pid: i for i, pid in enumerate(post_ids)}
+    posts.sort(key=lambda p: order.get(p.id, 999999))
+
+    return {"posts": [
+        {
+            "id": p.id,
+            "title": p.title,
+            "category": p.category,
+            "image_url": p.image_url,
+            "created_at": p.created_at,
+        }
+        for p in posts
+    ]}
+
 @app.post("/analytics/log-view/{post_id}")
 async def log_view(post_id: int, db: Session = Depends(get_db)):
     db.execute(update(Post).where(Post.id == post_id).values(view_count=func.coalesce(Post.view_count, 0) + 1))
