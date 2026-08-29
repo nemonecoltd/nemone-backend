@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Request, Header, BackgroundTasks
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date, update, or_
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Date, update, or_, ARRAY, Boolean, text as sql_text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -58,6 +58,7 @@ class Post(Base):
     tags = Column(String, nullable=True)
     created_at = Column(DateTime, default=func.now())
     view_count = Column(Integer, default=0)
+    affiliate_product_id = Column(Integer, ForeignKey("affiliate_products.id", ondelete="SET NULL"), nullable=True)
 
     comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
     likes = relationship("Like", back_populates="post", cascade="all, delete-orphan")
@@ -104,6 +105,22 @@ class DailyStat(Base):
     date = Column(Date, primary_key=True, default=func.current_date())
     visitors = Column(Integer, default=0)
     total_views = Column(Integer, default=0)
+
+class AffiliateProduct(Base):
+    """쿠팡 파트너스 상품 추천 — plants 서비스와 동일 구조.
+    글 작성 시 관리자가 직접 고르거나(Post.affiliate_product_id), 안 고르면
+    태그와 match_keywords를 부분일치시켜 프론트에서 자동으로 하나 골라 보여준다."""
+    __tablename__ = "affiliate_products"
+    id = Column(Integer, primary_key=True, index=True)
+    label = Column(String, nullable=False)
+    coupang_url = Column(String, nullable=False)
+    image_url = Column(String, nullable=True)
+    match_keywords = Column(ARRAY(String), nullable=False, server_default=sql_text("'{}'"))
+    sort_order = Column(Integer, nullable=False, server_default=sql_text("0"))
+    is_active = Column(Boolean, nullable=False, server_default=sql_text("true"))
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now())
+
 
 class PostView(Base):
     """조회 발생 시각 로그 — 주간 랭킹에서 '최근 N일 조회수'를 계산하기 위함.
@@ -283,6 +300,88 @@ def get_top_ranking():
 def get_admin_top_ranking():
     return _top_ranking_cache
 
+# ── 쿠팡 파트너스 상품 추천 ──────────────────────────────────────────────────
+# 글 작성 시 관리자가 직접 고르면(Post.affiliate_product_id) 그 상품이 최우선,
+# 안 고르면 프론트가 태그(콤마구분 문자열)와 match_keywords를 부분일치시켜
+# 하나를 자동으로 고른다(plants 서비스와 동일한 방식).
+
+def _parse_affiliate_id(raw: Optional[str]) -> Optional[int]:
+    """관리자 폼이 '선택 안 함'일 때 빈 문자열을 보내므로(Optional[int]로 받으면
+    FastAPI가 422를 냄) 문자열로 받아서 여기서 정수/None으로 정리한다."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _affiliate_product_summary(p: AffiliateProduct) -> dict:
+    return {
+        "id": p.id,
+        "label": p.label,
+        "coupang_url": p.coupang_url,
+        "image_url": p.image_url,
+        "match_keywords": p.match_keywords or [],
+    }
+
+
+@app.get("/affiliate-products")
+def list_affiliate_products(db: Session = Depends(get_db)):
+    products = (
+        db.query(AffiliateProduct)
+        .filter(AffiliateProduct.is_active.is_(True))
+        .order_by(AffiliateProduct.sort_order)
+        .all()
+    )
+    return {"items": [_affiliate_product_summary(p) for p in products]}
+
+
+class AffiliateProductRequest(BaseModel):
+    label: str
+    coupang_url: str
+    image_url: Optional[str] = None
+    match_keywords: List[str] = []
+    sort_order: int = 0
+    is_active: bool = True
+
+
+@app.get("/admin/affiliate-products", dependencies=[Depends(verify_admin)])
+def admin_list_affiliate_products(db: Session = Depends(get_db)):
+    products = db.query(AffiliateProduct).order_by(AffiliateProduct.sort_order).all()
+    return {"items": [{**_affiliate_product_summary(p), "is_active": p.is_active} for p in products]}
+
+
+@app.post("/admin/affiliate-products", dependencies=[Depends(verify_admin)])
+def admin_create_affiliate_product(req: AffiliateProductRequest, db: Session = Depends(get_db)):
+    p = AffiliateProduct(**req.dict())
+    db.add(p)
+    db.commit()
+    return {"id": p.id}
+
+
+@app.put("/admin/affiliate-products/{product_id}", dependencies=[Depends(verify_admin)])
+def admin_update_affiliate_product(product_id: int, req: AffiliateProductRequest, db: Session = Depends(get_db)):
+    p = db.query(AffiliateProduct).filter(AffiliateProduct.id == product_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="상품을 찾을 수 없습니다")
+    for k, v in req.dict().items():
+        setattr(p, k, v)
+    p.updated_at = datetime.now()
+    db.commit()
+    return {"id": p.id}
+
+
+@app.delete("/admin/affiliate-products/{product_id}", dependencies=[Depends(verify_admin)])
+def admin_delete_affiliate_product(product_id: int, db: Session = Depends(get_db)):
+    p = db.query(AffiliateProduct).filter(AffiliateProduct.id == product_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="상품을 찾을 수 없습니다")
+    db.delete(p)
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/posts/{post_id}")
 def get_post(post_id: int, db: Session = Depends(get_db)):
     post = db.query(Post).filter(Post.id == post_id).first()
@@ -310,6 +409,7 @@ async def create_post(
     content_type: str = Form("YOUTUBE_LONG"),
     video_url: Optional[str] = Form(""),
     tags: Optional[str] = Form(""),
+    affiliate_product_id: Optional[str] = Form(None),
     image_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     _: None = Depends(verify_admin)
@@ -331,7 +431,8 @@ async def create_post(
         db_post = Post(
             title=title, body_text=body_text, category=category,
             content_type=content_type, video_url=video_url,
-            image_url=image_web_url, tags=tags, view_count=0
+            image_url=image_web_url, tags=tags, view_count=0,
+            affiliate_product_id=_parse_affiliate_id(affiliate_product_id)
         )
         db.add(db_post)
         db.commit()
@@ -370,6 +471,7 @@ async def update_post(
     content_type: str = Form("YOUTUBE_LONG"),
     video_url: Optional[str] = Form(""),
     tags: Optional[str] = Form(""),
+    affiliate_product_id: Optional[str] = Form(None),
     image_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     _: None = Depends(verify_admin)
@@ -398,6 +500,7 @@ async def update_post(
         db_post.video_url = video_url
         db_post.tags = tags
         db_post.image_url = image_web_url
+        db_post.affiliate_product_id = _parse_affiliate_id(affiliate_product_id)
         db.commit()
         db.refresh(db_post)
         threading.Thread(target=_revalidate_post, args=(post_id,), daemon=True).start()
