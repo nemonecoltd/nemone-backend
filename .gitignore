@@ -4,3 +4,8 @@ out/
 .env*
 credentials/
 *.credentials.json
+venv/
+*.log
+*.tar.gz
+.DS_Store
+static/thumbnails/

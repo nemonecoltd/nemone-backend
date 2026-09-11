@@ -18,6 +18,7 @@ import threading
 import asyncio
 import urllib.request
 from datetime import date, datetime, timedelta
+from indexnow_service import ping_indexnow
 
 load_dotenv()
 
@@ -438,6 +439,7 @@ async def create_post(
         db.commit()
         db.refresh(db_post)
         threading.Thread(target=_revalidate_post, args=(db_post.id,), daemon=True).start()
+        threading.Thread(target=ping_indexnow, args=([f"https://nemoneai.com/posts/{db_post.id}"],), daemon=True).start()
         return db_post
     except Exception as e:
         db.rollback()
