@@ -131,6 +131,11 @@ class PostView(Base):
     post_id = Column(Integer, ForeignKey("posts.id"), index=True)
     viewed_at = Column(DateTime, default=func.now(), index=True)
 
+# 전자책 판매 모델(products/entitlements/reading_progress) — create_all 전에 정의해야
+# 테이블이 함께 생성된다(지시서 5-1장)
+import books_api
+Product, Entitlement, ReadingProgress = books_api.define_models(Base)
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -199,6 +204,12 @@ NEWS_SECRET_KEY = os.getenv("NEWS_SECRET_KEY")
 async def verify_admin(x_admin_secret: Optional[str] = Header(None)):
     if not ADMIN_SECRET_KEY or x_admin_secret != ADMIN_SECRET_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+# 전자책 권한 API 연결 — 모델과 get_db를 주입한 뒤 라우터를 등록한다.
+# (books_api는 main.py를 import하지 않는다 — 순환 참조 방지)
+books_api.bind(Product, Entitlement, ReadingProgress, get_db)
+books_api.register_admin_routes(books_api.router, verify_admin)
+app.include_router(books_api.router)
 
 # --- API 엔드포인트 (오직 Form 데이터만 받는 안정적인 구조) ---
 
