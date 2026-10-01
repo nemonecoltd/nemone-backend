@@ -183,7 +183,67 @@ def upload_to_gcs(file_obj, filename: str) -> str:
     blob.upload_from_string(upload_bytes, content_type=content_type)
     return f"https://storage.googleapis.com/{GCS_BUCKET}/{filename}"
 
-# Nginx에서 CORS(Access-Control-Allow-Origin: *)를 이미 추가하고 있으므로, 
+
+# 기사 본문에 외부 이미지 URL을 그대로 박아두면, 그 이미지를 소유한 쪽이 지우는 순간 기사가 깨진다.
+# 실제로 주간 랭킹 기사 14건이 now(PACE)의 이미지 URL을 직접 참조하고 있었는데, now는
+# cleanup_expired_data()가 종료 45일 뒤 이미지를 삭제하므로 시간이 지나면 반드시 깨졌다
+# (2026-09-24 실측: 111개 중 110개가 이미 깨진 상태였고, 그중 20건은 원본이 사라져 복구 불가).
+# 기사는 외부 서비스 수명에 묶이면 안 되는 독립 콘텐츠이므로, 발행/수정 시점에 외부 이미지를
+# 우리 GCS로 복사해 소유권을 가져온다.
+_OWN_IMG_PREFIX = f"https://storage.googleapis.com/{GCS_BUCKET}/"
+# 같은 버킷이라도 now-popup/ 아래는 now가 소유·삭제하는 경로라 반드시 복사 대상에 포함한다.
+_FOREIGN_IN_OWN_BUCKET = (f"{_OWN_IMG_PREFIX}now-popup/",)
+_BODY_IMG_SRC = re.compile(r'<img\b[^>]*?\bsrc="(https?://[^"]+)"', re.I)
+
+
+def _is_foreign_image(url: str) -> bool:
+    if url.startswith(_FOREIGN_IN_OWN_BUCKET):
+        return True
+    return not url.startswith(_OWN_IMG_PREFIX)
+
+
+def rehost_body_images(body_text: str) -> str:
+    """본문 <img src>의 외부 이미지를 우리 GCS로 복사하고 URL을 교체한 본문을 반환.
+
+    이미 우리 소유 경로인 이미지는 건너뛰므로, 같은 글을 여러 번 수정해도 재업로드되지 않는다.
+    개별 이미지 복사가 실패하면 그 URL만 원본 그대로 두고 계속 진행한다 — 이미지 한 장 때문에
+    기사 발행 자체가 막히면 안 되기 때문.
+
+    이미지는 동시에 복사한다. 한 장씩 순서대로 하면 장당 약 0.25초(다운로드+WebP 변환+업로드)라
+    본문 이미지 10장짜리 주간 랭킹 기사에서 관리자 "기사 생성" 응답이 약 2.5초 늦어졌다
+    (2026-10-01, GCS 업로드 시각으로 실측).
+    """
+    if not body_text:
+        return body_text
+
+    srcs: list = []
+    for match in _BODY_IMG_SRC.finditer(body_text):
+        src = match.group(1)
+        if src not in srcs and _is_foreign_image(src):
+            srcs.append(src)
+    if not srcs:
+        return body_text
+
+    def _copy(src: str):
+        try:
+            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as res:
+                raw = res.read()
+            import io as _io
+            return src, upload_to_gcs(_io.BytesIO(raw), f"{uuid.uuid4()}.webp")
+        except Exception as e:
+            print("[rehost_body_images] copy failed, keeping original (%s): %s" % (src, e))
+            return src, None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(srcs))) as pool:
+        for src, new_url in pool.map(_copy, srcs):
+            if new_url:
+                body_text = body_text.replace(src, new_url)
+    return body_text
+
+
+# Nginx에서 CORS(Access-Control-Allow-Origin: *)를 이미 추가하고 있으므로,
 # 백엔드에서는 중복 추가를 방지하기 위해 CORSMiddleware를 사용하지 않습니다.
 # 대신 브라우저의 OPTIONS(Preflight) 요청에 200 OK만 응답하도록 라우팅합니다.
 @app.options("/{full_path:path}")
@@ -427,6 +487,9 @@ async def create_post(
     _: None = Depends(verify_admin)
 ):
     try:
+        # 외부 이미지는 우리 GCS로 복사해 소유권을 가져온다(위 rehost_body_images 주석 참고)
+        body_text = await asyncio.to_thread(rehost_body_images, body_text)
+
         image_web_url = ""
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
@@ -492,6 +555,8 @@ async def update_post(
     db_post = db.query(Post).filter(Post.id == post_id).first()
     if not db_post: raise HTTPException(status_code=404, detail="수정할 게시물을 찾을 수 없습니다.")
     try:
+        body_text = await asyncio.to_thread(rehost_body_images, body_text)
+
         image_web_url = db_post.image_url
         if image_file and image_file.filename:
             file_ext = os.path.splitext(image_file.filename)[1]
