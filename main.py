@@ -60,6 +60,10 @@ class Post(Base):
     created_at = Column(DateTime, default=func.now())
     view_count = Column(Integer, default=0)
     affiliate_product_id = Column(Integer, ForeignKey("affiliate_products.id", ondelete="SET NULL"), nullable=True)
+    # 2026-10-03 매출개선 — 기사 하단 "관련 스토리" 3번째 칸을 관리자가 수동(제목+내부글 URL)으로
+    # 지정할 수 있게. 비어있으면(기존처럼) 같은 카테고리 글에서 자동으로 채움(RelatedAndNext 참고).
+    related3_title = Column(String, nullable=True)
+    related3_url = Column(String, nullable=True)
 
     comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
     likes = relationship("Like", back_populates="post", cascade="all, delete-orphan")
@@ -132,6 +136,14 @@ class PostView(Base):
     viewed_at = Column(DateTime, default=func.now(), index=True)
 
 Base.metadata.create_all(bind=engine)
+
+# create_all은 기존 테이블에 새 컬럼을 추가해주지 않는다(신규 테이블 생성만) — 이미 있는
+# posts 테이블에 related3_title/related3_url을 더하려면 직접 ALTER가 필요. IF NOT EXISTS라
+# 매번 시작할 때 실행해도 안전(멱등) — now_back/plants 쪽에서도 같은 패턴을 씀.
+with engine.connect() as _conn:
+    _conn.execute(sql_text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS related3_title VARCHAR"))
+    _conn.execute(sql_text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS related3_url VARCHAR"))
+    _conn.commit()
 
 app = FastAPI()
 
@@ -471,6 +483,8 @@ async def create_post(
     video_url: Optional[str] = Form(""),
     tags: Optional[str] = Form(""),
     affiliate_product_id: Optional[str] = Form(None),
+    related3_title: Optional[str] = Form(None),
+    related3_url: Optional[str] = Form(None),
     image_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     _: None = Depends(verify_admin)
@@ -496,7 +510,8 @@ async def create_post(
             title=title, body_text=body_text, category=category,
             content_type=content_type, video_url=video_url,
             image_url=image_web_url, tags=tags, view_count=0,
-            affiliate_product_id=_parse_affiliate_id(affiliate_product_id)
+            affiliate_product_id=_parse_affiliate_id(affiliate_product_id),
+            related3_title=(related3_title or None), related3_url=(related3_url or None),
         )
         db.add(db_post)
         db.commit()
@@ -537,6 +552,8 @@ async def update_post(
     video_url: Optional[str] = Form(""),
     tags: Optional[str] = Form(""),
     affiliate_product_id: Optional[str] = Form(None),
+    related3_title: Optional[str] = Form(None),
+    related3_url: Optional[str] = Form(None),
     image_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     _: None = Depends(verify_admin)
@@ -568,6 +585,8 @@ async def update_post(
         db_post.tags = tags
         db_post.image_url = image_web_url
         db_post.affiliate_product_id = _parse_affiliate_id(affiliate_product_id)
+        db_post.related3_title = related3_title or None
+        db_post.related3_url = related3_url or None
         db.commit()
         db.refresh(db_post)
         threading.Thread(target=_revalidate_post, args=(post_id,), daemon=True).start()
