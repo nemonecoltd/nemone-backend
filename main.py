@@ -938,6 +938,7 @@ ranking_scheduler.add_job(ga4_service.send_monthly_ga4_report, 'cron', day=1, ho
 ranking_scheduler.start()
 
 # 포털 피드 수집(30분 주기 + 기동 직후 1회) — 서비스별 실패는 서로 영향 없고 기존 스냅샷을 유지한다
+portal.set_aim_ranking_provider(lambda: _top_ranking_cache)  # 포털의 '이번 주 인기 글'은 맛매치 주간 랭킹 캐시를 그대로 쓴다
 portal.start(ranking_scheduler, engine)
 
 if __name__ == "__main__":

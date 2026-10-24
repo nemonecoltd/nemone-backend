@@ -37,6 +37,12 @@ ALLOWED_IMAGE_HOSTS = ("storage.googleapis.com", "plants.nemoneai.com", "nemonea
 CATEGORY_AIM = {"Taste": "TASTE", "Culture": "MIND", "Life": "LIFE", "Tech": "FUTURE"}
 
 _engine = None
+_aim_ranking_provider = None  # main.py가 주간 랭킹 캐시(refresh_top_ranking 결과)를 돌려주는 함수를 주입한다
+
+
+def set_aim_ranking_provider(fn) -> None:
+    global _aim_ranking_provider
+    _aim_ranking_provider = fn
 
 
 def _get_json(url: str, timeout: int = 6) -> Any:
@@ -82,35 +88,39 @@ def _parse_end_date(date_range: str) -> Optional[date]:
 
 
 # ───────────────────────── 서비스별 수집기(피드 규격으로 정규화) ─────────────────────────
+def _pace_item(p: dict, today: date) -> dict:
+    end = _parse_end_date(p.get("date_range") or "")
+    badge = None
+    if end is not None and 0 <= (end - today).days <= 7:
+        badge = "마감임박"
+    elif p.get("is_new"):
+        badge = "NEW"
+    region = (p.get("region") or "").strip()
+    return {
+        "id": str(p["id"]),
+        "title": p["title"],
+        "summary": _clean(" · ".join(x for x in (region, p.get("date_range")) if x), 80),
+        "image": _image_ok(p.get("image_url")),  # 외부 원본(KOPIS 등)이면 None — 랭킹 순위는 유지하고 화면에서 대체 이미지를 쓴다
+        "url": f"https://now.nemoneai.com/posts/{p['id']}",
+        "category": "PLACE",
+        "badge": badge,
+        "tags": [t for t in (region, "팝업스토어") if t],
+        "published_at": p.get("created_at"),
+    }
+
+
 def collect_pace(limit: int = 10) -> dict:
+    """ranking: PACE 인기 순위 TOP5(실시간일 필요 없음 — 30분 스냅샷). items: 이미지가 있는 항목(관찰 영역용)."""
     rows = _get_json(f"{PACE_BASE}/places/popular?limit=30")
     today = datetime.now(KST).date()
-    items = []
-    for p in rows if isinstance(rows, list) else []:
-        image = _image_ok(p.get("image_url"))
-        if not image or not p.get("title"):
-            continue  # 외부 원본(KOPIS 등) 이미지는 포털에 쓰지 않는다
-        end = _parse_end_date(p.get("date_range") or "")
-        badge = None
-        if end is not None and 0 <= (end - today).days <= 7:
-            badge = "마감임박"
-        elif p.get("is_new"):
-            badge = "NEW"
-        region = (p.get("region") or "").strip()
-        items.append({
-            "id": str(p["id"]),
-            "title": p["title"],
-            "summary": _clean(" · ".join(x for x in (region, p.get("date_range")) if x), 80),
-            "image": image,
-            "url": f"https://now.nemoneai.com/posts/{p['id']}",
-            "category": "PLACE",
-            "badge": badge,
-            "tags": [t for t in (region, "팝업스토어") if t],
-            "published_at": p.get("created_at"),
-        })
-        if len(items) >= limit:
-            break
-    return {"service": "pace", "updated_at": datetime.now(KST).isoformat(), "items": items}
+    rows = [p for p in (rows if isinstance(rows, list) else []) if p.get("title")]
+    ranking = []
+    for i, p in enumerate(rows[:5], start=1):
+        it = _pace_item(p, today)
+        it["rank"] = i
+        ranking.append(it)
+    items = [it for it in (_pace_item(p, today) for p in rows) if it["image"]][:limit]
+    return {"service": "pace", "updated_at": datetime.now(KST).isoformat(), "items": items, "ranking": ranking}
 
 
 def _guide_tags(raw) -> list:
@@ -148,6 +158,32 @@ def collect_plants(limit: int = 10) -> dict:
         if len(items) >= limit:
             break
     return {"service": "plants", "updated_at": datetime.now(KST).isoformat(), "items": items}
+
+
+def collect_plants_magazine(limit: int = 5) -> dict:
+    """PLANTS 매거진(맛매치 Special #6 소속 기사) 최신순. 1번 항목만 본문 앞부분을 요약으로 붙인다."""
+    rows = _get_json(f"{PLANTS_BASE}/api/magazine")
+    rows = sorted(rows if isinstance(rows, list) else [], key=lambda m: m.get("created_at") or "", reverse=True)
+    items = []
+    for i, m in enumerate(rows[:limit]):
+        summary = ""
+        if i == 0:
+            try:
+                summary = _clean(_get_json(f"{PLANTS_BASE}/api/magazine/{m['id']}").get("body_text"), 80)
+            except Exception:  # noqa: BLE001 — 요약은 부가 정보
+                summary = ""
+        items.append({
+            "id": str(m["id"]),
+            "title": m["title"],
+            "summary": summary,
+            "image": _image_ok(m.get("image_url"), PLANTS_BASE),
+            "url": f"{PLANTS_BASE}/guide/magazine/{m['id']}",
+            "category": "LIFE",
+            "badge": None,
+            "tags": [],
+            "published_at": m.get("created_at"),
+        })
+    return {"service": "plants_magazine", "updated_at": datetime.now(KST).isoformat(), "items": items}
 
 
 def collect_lii(limit: int = 2) -> dict:
@@ -193,7 +229,7 @@ def collect_lii(limit: int = 2) -> dict:
     return {"service": "lii", "updated_at": datetime.now(KST).isoformat(), "items": items}
 
 
-COLLECTORS = {"pace": collect_pace, "plants": collect_plants, "lii": collect_lii}
+COLLECTORS = {"pace": collect_pace, "plants": collect_plants, "plants_magazine": collect_plants_magazine, "lii": collect_lii}
 
 
 # ───────────────────────── 스냅샷 저장 ─────────────────────────
@@ -310,6 +346,42 @@ def aim_items(engine, limit: int = 40) -> list:
     return items
 
 
+def aim_ranking(engine, limit: int = 5) -> list:
+    """맛매치 주간 랭킹(하루 2회 재계산되는 TOP10 캐시). PACE·PLANTS 소속 기사는 그 서비스 몫이라 뺀다."""
+    if _aim_ranking_provider is None:
+        return []
+    rows = list(_aim_ranking_provider() or [])
+    with engine.connect() as conn:
+        owned = set()
+        for r in conn.execute(text("SELECT post_ids FROM specials WHERE id IN (:a, :b)"),
+                              {"a": SERVICE_SPECIAL_IDS[0], "b": SERVICE_SPECIAL_IDS[1]}):
+            try:
+                owned |= {int(x) for x in json.loads(r.post_ids)}
+            except Exception:  # noqa: BLE001
+                pass
+        rows = [r for r in rows if r["id"] not in owned][:limit]
+        bodies = {}
+        if rows:
+            first = rows[0]["id"]
+            b = conn.execute(text("SELECT body_text FROM posts WHERE id = :i"), {"i": first}).first()
+            bodies[first] = b.body_text if b else ""
+    items = []
+    for i, p in enumerate(rows, start=1):
+        items.append({
+            "id": str(p["id"]),
+            "title": p["title"],
+            "summary": _clean(re.sub(r"^\s*\d+\.\s*", "", re.sub(r"<[^>]*>", " ", bodies.get(p["id"], "")).strip()), 80),
+            "image": _image_ok(p.get("image_url")),
+            "url": f"/posts/{p['id']}",
+            "category": CATEGORY_AIM.get(p.get("category"), "LIFE"),
+            "badge": None,
+            "tags": [],
+            "published_at": str(p["created_at"]) if p.get("created_at") else None,
+            "rank": i,
+        })
+    return items
+
+
 def news_items(engine, limit: int = 4) -> list:
     try:
         with engine.connect() as conn:
@@ -333,57 +405,72 @@ def _slot(item: dict, service: str, slot: str) -> dict:
     return it
 
 
+def _panel(key: str, category: str, title: str, sub: str, link: str, service: str, items: list, ranked: bool) -> Optional[dict]:
+    if not items:
+        return None
+    return {
+        "key": key, "category": category, "title": title, "sub": sub, "link": link, "ranked": ranked,
+        "items": [_slot(it, service, f"{key}_{'rank' if ranked else 'item'}{i + 1}") for i, it in enumerate(items[:5])],
+    }
+
+
 def build_today(engine) -> dict:
     snaps = load_snapshots(engine)
-    pace = (snaps.get("pace") or {}).get("items", [])
+    pace_feed = snaps.get("pace") or {}
+    pace = pace_feed.get("items", [])
+    pace_rank = pace_feed.get("ranking", [])
     plants = (snaps.get("plants") or {}).get("items", [])
+    plants_mag = (snaps.get("plants_magazine") or {}).get("items", [])
     lii = (snaps.get("lii") or {}).get("items", [])
     try:
         aim = aim_items(engine)
     except Exception as e:  # noqa: BLE001
         logger.warning("[portal] AIM 조회 실패: %s", str(e)[:120])
         aim = []
+    try:
+        aim_rank = aim_ranking(engine)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[portal] AIM 랭킹 조회 실패: %s", str(e)[:120])
+        aim_rank = []
     taste = [a for a in aim if a["category"] == "TASTE"]
 
-    # 오늘의 발견: PACE 1 + AIM(Taste 우선) 1 + Plants 1 — 비는 칸은 다른 서비스 항목으로 채워 레이아웃을 유지
-    discover = []
-    for svc, pool, slot in (("pace", pace, "discover1"), ("aim", taste or aim, "discover2"), ("plants", plants, "discover3")):
-        if pool:
-            discover.append(_slot(pool[0], svc, slot))
-    pools = {"pace": pace[1:], "aim": (taste or aim)[1:], "plants": plants[1:]}
-    for svc in ("pace", "aim", "plants"):
-        while len(discover) < 3 and pools[svc]:
-            discover.append(_slot(pools[svc].pop(0), svc, f"discover{len(discover) + 1}"))
+    # 오늘의 발견: ① PACE 인기 TOP5 ② 맛매치(AIM) 주간 인기 TOP5 ③ PLANTS 매거진 최신 5 — 비는 패널은 숨긴다
+    discover = [p for p in (
+        _panel("pace", "PLACE", "지금 뜨는 곳 TOP 5", "최근 48시간 조회·좋아요 기준", "https://now.nemoneai.com/ranking/place", "pace", pace_rank, True),
+        _panel("aim", "TASTE", "이번 주 인기 글 TOP 5", "네모네 AIM 주간 랭킹", "/aim", "aim", aim_rank, True),
+        _panel("plants", "LIFE", "식물 매거진", "Plants 매거진 최신 글", "https://plants.nemoneai.com/guide/magazine", "plants", plants_mag, False),
+    ) if p]
 
-    used = {d["id"] for d in discover}
+    used = {(p["items"][i]["service"], p["items"][i]["id"]) for p in discover for i in range(len(p["items"]))}
 
     def mk(pool: list, svc: str, prefix: str, n: int) -> list:
         res = []
         for it in pool:
             if len(res) >= n:
                 break
+            if (svc, it["id"]) in used:
+                continue
             res.append(_slot(it, svc, f"{prefix}{len(res) + 1}"))
         return res
 
     observe_pool = {
-        "place": mk([x for x in pace if x["id"] not in used], "pace", "obs_place", 5),
-        "taste": mk([x for x in taste if x["id"] not in used], "aim", "obs_taste", 5),
-        "plant": mk([x for x in plants if x["id"] not in used], "plants", "obs_plant", 5),
+        "place": mk(pace, "pace", "obs_place", 5),
+        "taste": mk(taste, "aim", "obs_taste", 5),
+        "plant": mk(plants, "plants", "obs_plant", 5),
         "mind": [],
         "future": mk(lii, "lii", "obs_future", 5),
     }
     mixed = []
     for i in range(5):
-        for key, svc in (("taste", "aim"), ("place", "pace"), ("plant", "plants")):
+        for key in ("taste", "place", "plant"):
             if i < len(observe_pool[key]):
                 mixed.append(observe_pool[key][i])
-    # AIM의 Taste 외 카테고리(문화·라이프·테크) 최신 글도 '전체'에 섞는다
-    other_aim = mk([a for a in aim if a["category"] != "TASTE" and a["id"] not in used], "aim", "obs_aim", 3)
+    other_aim = mk([a for a in aim if a["category"] != "TASTE"], "aim", "obs_aim", 3)
     mixed = (mixed[:3] + other_aim[:1] + mixed[3:])[:5]
     observe = {"all": [dict(m, slot=f"obs_all{i + 1}") for i, m in enumerate(mixed)], **observe_pool}
 
     status = {k: ("ok" if (snaps.get(k) or {}).get("_ok") and (snaps.get(k) or {}).get("items") else "stale" if snaps.get(k) else "empty")
-              for k in ("pace", "plants", "lii")}
+              for k in ("pace", "plants", "plants_magazine", "lii")}
     status["aim"] = "ok" if aim else "empty"
     return {
         "date": datetime.now(KST).date().isoformat(),
@@ -392,11 +479,7 @@ def build_today(engine) -> dict:
         "lii": [_slot(x, "lii", f"lii{i + 1}") for i, x in enumerate(lii[:2])],
         "observe": observe,
         "aim_latest": [_slot(x, "aim", f"aim{i + 1}") for i, x in enumerate(aim[:6])],
-        "service_images": {
-            "pace": (pace[0]["image"] if pace else None),
-            "aim": ((taste or aim)[0]["image"] if (taste or aim) else None),
-            "plants": (plants[0]["image"] if plants else None),
-        },
+        "service_images": {},
         "news": news_items(engine),
         "status": status,
     }
