@@ -437,8 +437,8 @@ def build_today(engine) -> dict:
     # 오늘의 발견: ① PACE 인기 TOP5 ② 맛매치(AIM) 주간 인기 TOP5 ③ PLANTS 매거진 최신 5 — 비는 패널은 숨긴다
     discover = [p for p in (
         _panel("pace", "PLACE", "지금 뜨는 곳 TOP 5", "최근 48시간 조회·좋아요 기준", "https://now.nemoneai.com/ranking/place", "pace", pace_rank, True),
-        _panel("aim", "TASTE", "이번 주 인기 글 TOP 5", "네모네 AIM 주간 랭킹", "/aim", "aim", aim_rank, True),
-        _panel("plants", "LIFE", "식물 매거진", "Plants 매거진 최신 글", "https://plants.nemoneai.com/guide/magazine", "plants", plants_mag, False),
+        _panel("aim", "AIM", "이번 주 인기 글 TOP 5", "네모네 AIM 주간 랭킹", "/aim", "aim", aim_rank, True),
+        _panel("plants", "LIFE", "플랜트 매거진", "Plants 매거진 최신 글", "https://plants.nemoneai.com/guide/magazine", "plants", plants_mag, False),
     ) if p]
 
     used = {(p["items"][i]["service"], p["items"][i]["id"]) for p in discover for i in range(len(p["items"]))}
