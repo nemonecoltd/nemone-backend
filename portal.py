@@ -1,0 +1,441 @@
+"""네모네 포털(nemoneai.com `/`) 데이터 — 서비스별 피드 수집(스냅샷)과 통합 조회 API.
+
+설계(2026-10-24)
+- 포털은 다른 서비스의 DB를 직접 읽지 않는다. 각 서비스가 이미 공개하고 있는 조회 API만 서버에서 호출한다
+  (브라우저가 서비스 여러 곳을 직접 부르지 않음).
+- 서비스별 최신 **성공** 스냅샷 1행만 유지한다. 수집이 실패하면 기존 스냅샷을 덮어쓰지 않고 ok=false 만 표시한다.
+- 이미지는 자체 스토리지(GCS 등)만 쓴다. 네이버 CDN 등 외부 원본이면 그 항목은 제외한다.
+- AIM(맛매치) 글은 요청 시 DB에서 조회한다. PACE·PLANTS 소속 Special(5·6)의 글은 그 서비스 소유라 AIM 몫에서 뺀다.
+- LII는 매일 갱신되는 '오늘의 분석' 2건을 보여 준다(5년 재무 기반 분석 요약, 매수·매도 표현 없음).
+"""
+import ast
+import json
+import logging
+import re
+import threading
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from html import unescape
+from typing import Any, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import Response
+from sqlalchemy import text
+
+logger = logging.getLogger("portal")
+router = APIRouter(prefix="/portal")
+
+KST = timezone(timedelta(hours=9))
+PACE_BASE = "https://now.nemoneai.com/api-now"
+PLANTS_BASE = "https://plants.nemoneai.com"
+LII_BASE = "https://msm.nemoneai.com"
+AIM_BASE = "https://nemoneai.com"
+# PACE·PLANTS가 주인인 맛매치 Special — AIM 몫에서 제외(frontend/src/lib/serviceHome.ts 와 같은 번호)
+SERVICE_SPECIAL_IDS = (5, 6)
+ALLOWED_IMAGE_HOSTS = ("storage.googleapis.com", "plants.nemoneai.com", "nemoneai.com", "now.nemoneai.com")
+CATEGORY_AIM = {"Taste": "TASTE", "Culture": "MIND", "Life": "LIFE", "Tech": "FUTURE"}
+
+_engine = None
+
+
+def _get_json(url: str, timeout: int = 6) -> Any:
+    req = urllib.request.Request(url, headers={"User-Agent": "nemone-portal-collector/1.0", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def _clean(raw: Optional[str], limit: int = 80) -> str:
+    s = re.sub(r"<[^>]*>", " ", raw or "")
+    s = unescape(s).replace(" ", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def _image_ok(url: Optional[str], base: str = "") -> Optional[str]:
+    """자체 스토리지 이미지만 통과. 상대경로는 서비스 주소로 절대화."""
+    if not url:
+        return None
+    if url.startswith("/"):
+        url = base.rstrip("/") + url
+    host = urllib.parse.urlparse(url).netloc.lower()
+    return url if host in ALLOWED_IMAGE_HOSTS else None
+
+
+def _utm(url: str, service: str, slot: str) -> str:
+    if not url.startswith("http"):
+        return url
+    q = urllib.parse.urlencode({"utm_source": "nemone_portal", "utm_medium": "today", "utm_content": f"{service}_{slot}"})
+    return url + ("&" if "?" in url else "?") + q
+
+
+def _parse_end_date(date_range: str) -> Optional[date]:
+    """'2026.10.22. ~ 2026.10.28.' → 마지막 날짜"""
+    found = re.findall(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", date_range or "")
+    if not found:
+        return None
+    y, m, d = (int(x) for x in found[-1])
+    try:
+        return date(y, m, d)
+    except ValueError:
+        return None
+
+
+# ───────────────────────── 서비스별 수집기(피드 규격으로 정규화) ─────────────────────────
+def collect_pace(limit: int = 10) -> dict:
+    rows = _get_json(f"{PACE_BASE}/places/popular?limit=30")
+    today = datetime.now(KST).date()
+    items = []
+    for p in rows if isinstance(rows, list) else []:
+        image = _image_ok(p.get("image_url"))
+        if not image or not p.get("title"):
+            continue  # 외부 원본(KOPIS 등) 이미지는 포털에 쓰지 않는다
+        end = _parse_end_date(p.get("date_range") or "")
+        badge = None
+        if end is not None and 0 <= (end - today).days <= 7:
+            badge = "마감임박"
+        elif p.get("is_new"):
+            badge = "NEW"
+        region = (p.get("region") or "").strip()
+        items.append({
+            "id": str(p["id"]),
+            "title": p["title"],
+            "summary": _clean(" · ".join(x for x in (region, p.get("date_range")) if x), 80),
+            "image": image,
+            "url": f"https://now.nemoneai.com/posts/{p['id']}",
+            "category": "PLACE",
+            "badge": badge,
+            "tags": [t for t in (region, "팝업스토어") if t],
+            "published_at": p.get("created_at"),
+        })
+        if len(items) >= limit:
+            break
+    return {"service": "pace", "updated_at": datetime.now(KST).isoformat(), "items": items}
+
+
+def _guide_tags(raw) -> list:
+    if isinstance(raw, list):
+        return [str(x) for x in raw][:3]
+    try:
+        v = ast.literal_eval(raw) if isinstance(raw, str) else []
+        return [str(x) for x in v][:3] if isinstance(v, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def collect_plants(limit: int = 10) -> dict:
+    data = _get_json(f"{PLANTS_BASE}/api/guides?limit=40")
+    rows = data.get("items", data) if isinstance(data, dict) else data
+    items = []
+    # 최신순으로 정렬한 뒤, 직접 쓴 글(original)을 앞으로(안정 정렬이라 그 안에서는 최신순 유지)
+    ordered = sorted(rows or [], key=lambda g: g.get("published_at") or "", reverse=True)
+    ordered.sort(key=lambda g: 0 if g.get("source") == "original" else 1)
+    for g in ordered:
+        image = _image_ok(g.get("thumbnail_url"), PLANTS_BASE)
+        if not image or not g.get("title"):
+            continue
+        items.append({
+            "id": g["slug"],
+            "title": g["title"],
+            "summary": _clean(g.get("summary"), 80),
+            "image": image,
+            "url": f"{PLANTS_BASE}/guide/{g['slug']}",
+            "category": "LIFE",
+            "badge": None,
+            "tags": _guide_tags(g.get("tags")),
+            "published_at": g.get("published_at"),
+        })
+        if len(items) >= limit:
+            break
+    return {"service": "plants", "updated_at": datetime.now(KST).isoformat(), "items": items}
+
+
+def collect_lii(limit: int = 2) -> dict:
+    """LII '오늘의 분석' — 5년 재무 기반 분석 요약. 매수·매도 판단 문구는 가져오지 않는다(요약 첫 문장과 4개 점수만)."""
+    data = _get_json(f"{LII_BASE}/api/company/ai-view-picks?limit={limit}")
+    rows = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(rows, dict):  # {"data": {"items": [...]}} 형태
+        rows = rows.get("items", [])
+    items = []
+    for c in rows or []:
+        summary = c.get("summary")
+        if isinstance(summary, str):
+            try:
+                summary = json.loads(summary)
+            except Exception:  # noqa: BLE001
+                try:
+                    summary = ast.literal_eval(summary)
+                except Exception:  # noqa: BLE001
+                    summary = {}
+        sentences = (summary or {}).get("sentences") or []
+        first = _clean(sentences[0].get("text") if sentences else "", 110)
+        sc = c.get("five_axis_scores") or {}
+        if isinstance(sc, str):
+            try:
+                sc = json.loads(sc)
+            except Exception:  # noqa: BLE001
+                try:
+                    sc = ast.literal_eval(sc)
+                except Exception:  # noqa: BLE001
+                    sc = {}
+        items.append({
+            "id": c["ticker"],
+            "title": c["name"],
+            "summary": first,
+            "image": None,
+            "url": f"{LII_BASE}/company/{c['ticker']}/ai-view",
+            "category": "FUTURE",
+            "badge": None,
+            "tags": [],
+            "scores": {k: sc.get(k) for k in ("growth", "profitability", "valuation", "financial_health")},
+            "published_at": c.get("generated_at"),
+        })
+    return {"service": "lii", "updated_at": datetime.now(KST).isoformat(), "items": items}
+
+
+COLLECTORS = {"pace": collect_pace, "plants": collect_plants, "lii": collect_lii}
+
+
+# ───────────────────────── 스냅샷 저장 ─────────────────────────
+def init_tables(engine) -> None:
+    global _engine
+    _engine = engine
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS portal_feed (
+                service TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                fetched_at TIMESTAMP NOT NULL,
+                ok BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """))
+        pk = "SERIAL PRIMARY KEY" if engine.dialect.name == "postgresql" else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS portal_clicks (
+                id {pk},
+                service TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+        """))
+
+
+def save_snapshot(engine, service: str, feed: dict) -> bool:
+    """성공(항목 1개 이상)일 때만 덮어쓴다. 실패·빈 응답이면 기존 스냅샷 유지하고 ok=false 만 표시."""
+    now = datetime.now(KST).replace(tzinfo=None)
+    with engine.begin() as conn:
+        if feed and feed.get("items"):
+            res = conn.execute(text("UPDATE portal_feed SET payload=:p, fetched_at=:t, ok=TRUE WHERE service=:s"),
+                               {"p": json.dumps(feed, ensure_ascii=False), "t": now, "s": service})
+            if not res.rowcount:
+                conn.execute(text("INSERT INTO portal_feed (service, payload, fetched_at, ok) VALUES (:s,:p,:t,TRUE)"),
+                             {"s": service, "p": json.dumps(feed, ensure_ascii=False), "t": now})
+            return True
+        conn.execute(text("UPDATE portal_feed SET ok=FALSE WHERE service=:s"), {"s": service})
+        return False
+
+
+def refresh_all(engine=None) -> dict:
+    engine = engine or _engine
+    result = {}
+    for name, fn in COLLECTORS.items():
+        try:
+            result[name] = save_snapshot(engine, name, fn())
+        except Exception as e:  # noqa: BLE001 — 한 서비스 실패가 다른 서비스 수집을 막지 않는다
+            logger.warning("[portal] %s 수집 실패(기존 스냅샷 유지): %s", name, str(e)[:120])
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE portal_feed SET ok=FALSE WHERE service=:s"), {"s": name})
+            except Exception:  # noqa: BLE001
+                pass
+            result[name] = False
+    return result
+
+
+def start(scheduler, engine) -> None:
+    """서버 기동 시: 테이블 준비 + 즉시 1회 수집(백그라운드) + 30분 주기. 기존 스케줄러에 얹는다."""
+    init_tables(engine)
+    scheduler.add_job(refresh_all, "cron", minute="7,37", id="portal_refresh", kwargs={"engine": engine},
+                      max_instances=1, coalesce=True)
+    threading.Timer(3.0, refresh_all, kwargs={"engine": engine}).start()
+
+
+def load_snapshots(engine) -> dict:
+    out = {}
+    with engine.connect() as conn:
+        for r in conn.execute(text("SELECT service, payload, fetched_at, ok FROM portal_feed")):
+            try:
+                feed = json.loads(r.payload)
+            except Exception:  # noqa: BLE001
+                continue
+            feed["_fetched_at"] = str(r.fetched_at) if r.fetched_at else None
+            feed["_ok"] = bool(r.ok)
+            out[r.service] = feed
+    return out
+
+
+# ───────────────────────── AIM(맛매치) 글: 요청 시 DB 조회 ─────────────────────────
+def aim_items(engine, limit: int = 40) -> list:
+    with engine.connect() as conn:
+        owned = set()
+        for r in conn.execute(text("SELECT post_ids FROM specials WHERE id IN (:a, :b)"),
+                              {"a": SERVICE_SPECIAL_IDS[0], "b": SERVICE_SPECIAL_IDS[1]}):
+            try:
+                owned |= {int(x) for x in json.loads(r.post_ids)}
+            except Exception:  # noqa: BLE001
+                pass
+        rows = conn.execute(text(
+            "SELECT id, title, body_text, category, image_url, created_at FROM posts ORDER BY created_at DESC LIMIT :n"
+        ), {"n": limit * 2}).fetchall()
+    items = []
+    for p in rows:
+        if p.id in owned:
+            continue  # PACE·PLANTS 소속 기사는 그 서비스 몫
+        image = _image_ok(p.image_url)
+        if not image:
+            continue
+        items.append({
+            "id": str(p.id),
+            "title": p.title,
+            "summary": _clean(re.sub(r"^\s*\d+\.\s*", "", re.sub(r"<[^>]*>", " ", p.body_text or "").strip()), 80),
+            "image": image,
+            "url": f"/posts/{p.id}",  # 내부 링크(UTM 없음 — 정본 URL 변형을 만들지 않는다)
+            "category": CATEGORY_AIM.get(p.category, "LIFE"),
+            "badge": None,
+            "tags": [],
+            "published_at": str(p.created_at) if p.created_at else None,
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
+def news_items(engine, limit: int = 4) -> list:
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, title, created_at FROM nemone_news ORDER BY created_at DESC LIMIT :n"), {"n": limit}).fetchall()
+        return [{"id": r.id, "title": r.title, "url": f"https://home.nemoneai.com/notice/{r.id}/",
+                 "date": str(r.created_at)[:10].replace("-", ".") if r.created_at else ""} for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# ───────────────────────── 통합 응답 ─────────────────────────
+SERVICE_LABEL = {"pace": "네모네 PACE", "aim": "네모네 AIM", "plants": "네모네 Plants", "lii": "네모네 LII"}
+
+
+def _slot(item: dict, service: str, slot: str) -> dict:
+    it = dict(item)
+    it["service"] = service
+    it["service_label"] = SERVICE_LABEL.get(service, service)
+    it["url"] = _utm(it["url"], service, slot)
+    it["slot"] = slot
+    return it
+
+
+def build_today(engine) -> dict:
+    snaps = load_snapshots(engine)
+    pace = (snaps.get("pace") or {}).get("items", [])
+    plants = (snaps.get("plants") or {}).get("items", [])
+    lii = (snaps.get("lii") or {}).get("items", [])
+    try:
+        aim = aim_items(engine)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[portal] AIM 조회 실패: %s", str(e)[:120])
+        aim = []
+    taste = [a for a in aim if a["category"] == "TASTE"]
+
+    # 오늘의 발견: PACE 1 + AIM(Taste 우선) 1 + Plants 1 — 비는 칸은 다른 서비스 항목으로 채워 레이아웃을 유지
+    discover = []
+    for svc, pool, slot in (("pace", pace, "discover1"), ("aim", taste or aim, "discover2"), ("plants", plants, "discover3")):
+        if pool:
+            discover.append(_slot(pool[0], svc, slot))
+    pools = {"pace": pace[1:], "aim": (taste or aim)[1:], "plants": plants[1:]}
+    for svc in ("pace", "aim", "plants"):
+        while len(discover) < 3 and pools[svc]:
+            discover.append(_slot(pools[svc].pop(0), svc, f"discover{len(discover) + 1}"))
+
+    used = {d["id"] for d in discover}
+
+    def mk(pool: list, svc: str, prefix: str, n: int) -> list:
+        res = []
+        for it in pool:
+            if len(res) >= n:
+                break
+            res.append(_slot(it, svc, f"{prefix}{len(res) + 1}"))
+        return res
+
+    observe_pool = {
+        "place": mk([x for x in pace if x["id"] not in used], "pace", "obs_place", 5),
+        "taste": mk([x for x in taste if x["id"] not in used], "aim", "obs_taste", 5),
+        "plant": mk([x for x in plants if x["id"] not in used], "plants", "obs_plant", 5),
+        "mind": [],
+        "future": mk(lii, "lii", "obs_future", 5),
+    }
+    mixed = []
+    for i in range(5):
+        for key, svc in (("taste", "aim"), ("place", "pace"), ("plant", "plants")):
+            if i < len(observe_pool[key]):
+                mixed.append(observe_pool[key][i])
+    # AIM의 Taste 외 카테고리(문화·라이프·테크) 최신 글도 '전체'에 섞는다
+    other_aim = mk([a for a in aim if a["category"] != "TASTE" and a["id"] not in used], "aim", "obs_aim", 3)
+    mixed = (mixed[:3] + other_aim[:1] + mixed[3:])[:5]
+    observe = {"all": [dict(m, slot=f"obs_all{i + 1}") for i, m in enumerate(mixed)], **observe_pool}
+
+    status = {k: ("ok" if (snaps.get(k) or {}).get("_ok") and (snaps.get(k) or {}).get("items") else "stale" if snaps.get(k) else "empty")
+              for k in ("pace", "plants", "lii")}
+    status["aim"] = "ok" if aim else "empty"
+    return {
+        "date": datetime.now(KST).date().isoformat(),
+        "generated_at": datetime.now(KST).isoformat(),
+        "discover": discover,
+        "lii": [_slot(x, "lii", f"lii{i + 1}") for i, x in enumerate(lii[:2])],
+        "observe": observe,
+        "aim_latest": [_slot(x, "aim", f"aim{i + 1}") for i, x in enumerate(aim[:6])],
+        "service_images": {
+            "pace": (pace[0]["image"] if pace else None),
+            "aim": ((taste or aim)[0]["image"] if (taste or aim) else None),
+            "plants": (plants[0]["image"] if plants else None),
+        },
+        "news": news_items(engine),
+        "status": status,
+    }
+
+
+@router.get("/today")
+def portal_today(response: Response):
+    response.headers["Cache-Control"] = "public, max-age=600"
+    try:
+        return build_today(_engine)
+    except Exception as e:  # noqa: BLE001 — 500 대신 빈 응답(포털은 빈 상태로도 정상 표시)
+        logger.warning("[portal] today 실패: %s", str(e)[:160])
+        return {"date": datetime.now(KST).date().isoformat(), "generated_at": None, "discover": [], "lii": [], "observe": {
+            "all": [], "place": [], "taste": [], "plant": [], "mind": [], "future": []}, "aim_latest": [],
+            "service_images": {}, "news": [], "status": {"error": True}}
+
+
+_click_lock = threading.Lock()
+_click_recent: dict = {}
+
+
+@router.post("/click")
+async def portal_click(request: Request):
+    """포털 → 서비스 이동 클릭 기록(beacon). 개인정보 없음. 같은 IP의 과도한 호출은 무시."""
+    try:
+        body = await request.json()
+        service = str(body.get("service", ""))[:20]
+        slot = str(body.get("slot", ""))[:40]
+        ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "")).split(",")[0].strip()
+        now = datetime.now(KST)
+        with _click_lock:
+            recent = [t for t in _click_recent.get(ip, []) if (now - t).total_seconds() < 60]
+            if len(recent) >= 30 or not re.fullmatch(r"[a-z0-9_\-]{1,20}", service) or not re.fullmatch(r"[a-z0-9_\-]{1,40}", slot):
+                return Response(status_code=204)
+            recent.append(now)
+            _click_recent[ip] = recent
+        with _engine.begin() as conn:
+            conn.execute(text("INSERT INTO portal_clicks (service, slot, created_at) VALUES (:s,:l,:t)"),
+                         {"s": service, "l": slot, "t": now.replace(tzinfo=None)})
+    except Exception:  # noqa: BLE001
+        pass
+    return Response(status_code=204)

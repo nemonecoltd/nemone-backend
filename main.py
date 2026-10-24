@@ -38,8 +38,8 @@ SQLALCHEMY_DATABASE_URL = (
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
-    pool_size=3,
-    max_overflow=5,
+    pool_size=2,   # 트래픽 대비 과도해서 축소 (2026-10-05): 실사용 3개, 한도 22개(db-f1-micro) 공유
+    max_overflow=1,
     pool_timeout=30,
     pool_recycle=1800,
     pool_pre_ping=True,  # 커넥션 재사용 전 헬스체크 — 없으면 끊긴 커넥션을 그대로 쓰다 "server closed the connection unexpectedly"로 요청이 실패함
@@ -146,6 +146,10 @@ with engine.connect() as _conn:
     _conn.commit()
 
 app = FastAPI()
+
+# 네모네 포털(/) 데이터 API — 서비스별 피드 스냅샷 + 통합 조회(GET /portal/today), 클릭 기록(POST /portal/click)
+import portal
+app.include_router(portal.router)
 
 # 업로드 용량 제한 확장 (50MB)
 @app.middleware("http")
@@ -599,8 +603,16 @@ async def update_post(
 def delete_post(post_id: int, db: Session = Depends(get_db), _: None = Depends(verify_admin)):
     db_post = db.query(Post).filter(Post.id == post_id).first()
     if not db_post: raise HTTPException(status_code=404, detail="삭제할 게시물을 찾을 수 없습니다.")
-    db.delete(db_post)
-    db.commit()
+    # post_views(조회 로그)는 posts.id를 FK(NO ACTION)로 참조하는데 Post 관계 cascade에 빠져 있어서, 조회 기록이 한 번이라도 있는
+    # 글은 삭제가 IntegrityError(500)로 막혔다(2026-10-23 id=27 삭제 실패로 발견). 글과 함께 조회 로그도 지운다.
+    try:
+        db.query(PostView).filter(PostView.post_id == post_id).delete(synchronize_session=False)
+        db.delete(db_post)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"삭제 중 오류: {e}")
+    threading.Thread(target=_revalidate_post, args=(post_id,), daemon=True).start()   # 삭제된 글 페이지 캐시를 바로 무효화
     return {"message": "Successfully deleted", "id": post_id}
 
 # --- 기타 API ---
@@ -924,6 +936,9 @@ ranking_scheduler.add_job(ga4_service.send_weekly_ga4_report, 'cron', day_of_wee
 ranking_scheduler.add_job(ga4_service.send_monthly_ga4_report, 'cron', day=1, hour=1, minute=10, id='ga4_monthly_kst_1st_1000')
 
 ranking_scheduler.start()
+
+# 포털 피드 수집(30분 주기 + 기동 직후 1회) — 서비스별 실패는 서로 영향 없고 기존 스냅샷을 유지한다
+portal.start(ranking_scheduler, engine)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
