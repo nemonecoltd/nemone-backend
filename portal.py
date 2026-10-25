@@ -227,7 +227,7 @@ def collect_plants_magazine(limit: int = 5) -> dict:
     return {"service": "plants_magazine", "updated_at": datetime.now(KST).isoformat(), "items": items}
 
 
-def collect_lii(limit: int = 2) -> dict:
+def collect_lii(limit: int = 7) -> dict:  # 앞 2건은 '오늘의 분석', 나머지는 '오늘의 관찰 > 미래' 탭
     """LII '오늘의 분석' — 5년 재무 기반 분석 요약. 매수·매도 판단 문구는 가져오지 않는다(요약 첫 문장과 4개 점수만)."""
     data = _get_json(f"{LII_BASE}/api/company/ai-view-picks?limit={limit}")
     rows = data.get("data", data) if isinstance(data, dict) else data
@@ -563,7 +563,7 @@ def build_today(engine) -> dict:
         "taste": mk(taste, "aim", "obs_taste", 5),
         "plant": mk(plants, "plants", "obs_plant", 5),
         "mind": [],
-        "future": mk(lii, "lii", "obs_future", 5),
+        "future": mk(lii[2:], "lii", "obs_future", 5),   # 오늘의 분석(앞 2건)과 겹치지 않게 그 다음 순위부터
     }
     mixed = []
     for i in range(5):
