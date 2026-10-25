@@ -34,6 +34,15 @@ AIM_BASE = "https://nemoneai.com"
 # PACE·PLANTS가 주인인 맛매치 Special — AIM 몫에서 제외(frontend/src/lib/serviceHome.ts 와 같은 번호)
 SERVICE_SPECIAL_IDS = (5, 6)
 ALLOWED_IMAGE_HOSTS = ("storage.googleapis.com", "plants.nemoneai.com", "nemoneai.com", "now.nemoneai.com")
+YOUTUBE_CHANNEL_ID = "UCXQyHkjZNGNWNmm3Tio9Amg"            # https://www.youtube.com/@nemoneaim
+YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@nemoneaim"
+PODCAST_RSS = "https://anchor.fm/s/10cc660d0/podcast/rss"    # 맛의문명사 | 네모네AIM (애플·스포티파이가 받아 가는 원본 피드)
+PODCAST_URL = "https://podcasts.apple.com/kr/podcast/%EB%A7%9B%EC%9D%98%EB%AC%B8%EB%AA%85%EC%82%AC-%EB%84%A4%EB%AA%A8%EB%84%A4aim/id1861121835"
+BLOG_RSS = "https://rss.blog.naver.com/nemoneaim.xml"
+BLOG_URL = "https://blog.naver.com/nemoneaim"
+# 오늘의 채널 썸네일은 외부 플랫폼 이미지라 별도 허용 목록(서비스 피드의 '자체 스토리지만' 규칙과 분리)
+CHANNEL_IMAGE_HOSTS = ("i.ytimg.com", "i1.ytimg.com", "i2.ytimg.com", "i3.ytimg.com", "img.youtube.com",
+                       "d3t3ozftmdmh3i.cloudfront.net", "blogthumb.pstatic.net", "postfiles.pstatic.net", "blogpfthumb-phinf.pstatic.net")
 CATEGORY_AIM = {"Taste": "TASTE", "Culture": "MIND", "Life": "LIFE", "Tech": "FUTURE"}
 
 _engine = None
@@ -49,6 +58,36 @@ def _get_json(url: str, timeout: int = 6) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": "nemone-portal-collector/1.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as res:
         return json.loads(res.read().decode("utf-8"))
+
+
+def _get_text(url: str, timeout: int = 8) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; nemone-portal-collector/1.0)", "Accept": "application/xml,text/xml,*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        return res.read().decode("utf-8", errors="replace")
+
+
+def _rfc_to_kst_iso(value: Optional[str]) -> Optional[str]:
+    """RSS pubDate(RFC 2822)·Atom published(ISO) → KST ISO 문자열."""
+    if not value:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value)
+    except Exception:  # noqa: BLE001
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(KST).isoformat()
+
+
+def _channel_image(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    u = url.replace("http://", "https://", 1)
+    return u if urllib.parse.urlparse(u).netloc.lower() in CHANNEL_IMAGE_HOSTS else None
 
 
 def _clean(raw: Optional[str], limit: int = 80) -> str:
@@ -229,9 +268,66 @@ def collect_lii(limit: int = 2) -> dict:
     return {"service": "lii", "updated_at": datetime.now(KST).isoformat(), "items": items}
 
 
-COLLECTORS = {"pace": collect_pace, "plants": collect_plants, "plants_magazine": collect_plants_magazine, "lii": collect_lii}
+def collect_youtube(limit: int = 5) -> dict:
+    """유튜브 채널 RSS(Atom) — 쇼츠·실시간 방송은 제외하고 정식 영상만."""
+    import xml.etree.ElementTree as ET
+    ns = {"a": "http://www.w3.org/2005/Atom", "m": "http://search.yahoo.com/mrss/"}
+    root = ET.fromstring(_get_text(f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"))
+    items = []
+    for e in root.findall("a:entry", ns):
+        link = (e.find("a:link", ns).get("href") if e.find("a:link", ns) is not None else "") or ""
+        title = _clean(e.findtext("a:title", namespaces=ns), 90)
+        if "/shorts/" in link or "실시간 스트림" in title or not link:
+            continue
+        vid = (e.findtext("{http://www.youtube.com/xml/schemas/2015}videoId") or link.rsplit("=", 1)[-1])
+        th = e.find("m:group/m:thumbnail", ns)
+        items.append({
+            "id": vid, "title": title, "summary": "", "image": _channel_image(th.get("url") if th is not None else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"),
+            "url": link, "category": "YOUTUBE", "badge": None, "tags": [], "published_at": _rfc_to_kst_iso(e.findtext("a:published", namespaces=ns)),
+        })
+        if len(items) >= limit:
+            break
+    return {"service": "youtube", "updated_at": datetime.now(KST).isoformat(), "items": items}
 
 
+def collect_podcast(limit: int = 5) -> dict:
+    """맛의문명사 팟캐스트 RSS — 에피소드 제목·이미지·재생 시간. 링크는 RSS의 에피소드 페이지."""
+    import xml.etree.ElementTree as ET
+    ns = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+    ch = ET.fromstring(_get_text(PODCAST_RSS)).find("channel")
+    show_img = ch.find("itunes:image", ns)
+    show_img = show_img.get("href") if show_img is not None else None
+    items = []
+    for it in ch.findall("item")[:limit]:
+        im = it.find("itunes:image", ns)
+        dur = (it.findtext("itunes:duration", namespaces=ns) or "").strip()
+        items.append({
+            "id": (it.findtext("guid") or it.findtext("link") or "")[-40:], "title": _clean(it.findtext("title"), 90),
+            "summary": f"재생 {dur}" if dur else "", "image": _channel_image((im.get("href") if im is not None else None) or show_img),
+            "url": it.findtext("link") or PODCAST_URL, "category": "PODCAST", "badge": None, "tags": [], "published_at": _rfc_to_kst_iso(it.findtext("pubDate")),
+        })
+    return {"service": "podcast", "updated_at": datetime.now(KST).isoformat(), "items": [x for x in items if x["title"]]}
+
+
+def collect_blog(limit: int = 5) -> dict:
+    """네이버 블로그 RSS — 제목·요약·본문 첫 이미지. 링크의 추적 파라미터(fromRss 등)는 뗀다."""
+    import xml.etree.ElementTree as ET
+    ch = ET.fromstring(_get_text(BLOG_RSS)).find("channel")
+    items = []
+    for it in ch.findall("item")[:limit]:
+        desc = it.findtext("description") or ""
+        m = re.search(r'<img[^>]*src="([^"]+)"', desc)
+        link = (it.findtext("link") or "").split("?")[0] or BLOG_URL
+        items.append({
+            "id": link.rsplit("/", 1)[-1], "title": _clean(it.findtext("title"), 90), "summary": _clean(desc, 70),
+            "image": _channel_image(unescape(m.group(1)) if m else None), "url": link, "category": "BLOG", "badge": None, "tags": [],
+            "published_at": _rfc_to_kst_iso(it.findtext("pubDate")),
+        })
+    return {"service": "blog", "updated_at": datetime.now(KST).isoformat(), "items": [x for x in items if x["title"]]}
+
+
+COLLECTORS = {"pace": collect_pace, "plants": collect_plants, "plants_magazine": collect_plants_magazine, "lii": collect_lii,
+              "youtube": collect_youtube, "podcast": collect_podcast, "blog": collect_blog}
 # ───────────────────────── 스냅샷 저장 ─────────────────────────
 def init_tables(engine) -> None:
     global _engine
@@ -470,12 +566,18 @@ def build_today(engine) -> dict:
     observe = {"all": [dict(m, slot=f"obs_all{i + 1}") for i, m in enumerate(mixed)], **observe_pool}
 
     status = {k: ("ok" if (snaps.get(k) or {}).get("_ok") and (snaps.get(k) or {}).get("items") else "stale" if snaps.get(k) else "empty")
-              for k in ("pace", "plants", "plants_magazine", "lii")}
+              for k in ("pace", "plants", "plants_magazine", "lii", "youtube", "podcast", "blog")}
     status["aim"] = "ok" if aim else "empty"
+    channels = [p for p in (
+        _panel("youtube", "YOUTUBE", "유튜브", "맛의문명사 | 네모네AIM 채널", YOUTUBE_CHANNEL_URL, "youtube", (snaps.get("youtube") or {}).get("items", []), False),
+        _panel("podcast", "PODCAST", "팟캐스트", "맛의문명사 에피소드", PODCAST_URL, "podcast", (snaps.get("podcast") or {}).get("items", []), False),
+        _panel("blog", "BLOG", "네이버 블로그", "네모네AIM 블로그", BLOG_URL, "blog", (snaps.get("blog") or {}).get("items", []), False),
+    ) if p]
     return {
         "date": datetime.now(KST).date().isoformat(),
         "generated_at": datetime.now(KST).isoformat(),
         "discover": discover,
+        "channels": channels,
         "lii": [_slot(x, "lii", f"lii{i + 1}") for i, x in enumerate(lii[:2])],
         "observe": observe,
         "aim_latest": [_slot(x, "aim", f"aim{i + 1}") for i, x in enumerate(aim[:6])],
