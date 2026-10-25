@@ -34,6 +34,8 @@ AIM_BASE = "https://nemoneai.com"
 # PACE·PLANTS가 주인인 맛매치 Special — AIM 몫에서 제외(frontend/src/lib/serviceHome.ts 와 같은 번호)
 SERVICE_SPECIAL_IDS = (5, 6)
 ALLOWED_IMAGE_HOSTS = ("storage.googleapis.com", "plants.nemoneai.com", "nemoneai.com", "now.nemoneai.com")
+LII_THUMB = "/portal/lii-thumb.jpg"
+LII_THUMB_SQUARE = "/portal/lii-thumb-sq.jpg"
 YOUTUBE_CHANNEL_ID = "UCXQyHkjZNGNWNmm3Tio9Amg"            # https://www.youtube.com/@nemoneaim
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@nemoneaim"
 PODCAST_RSS = "https://anchor.fm/s/10cc660d0/podcast/rss"    # 맛의문명사 | 네모네AIM (애플·스포티파이가 받아 가는 원본 피드)
@@ -259,7 +261,8 @@ def collect_lii(limit: int = 7) -> dict:  # 앞 2건은 '오늘의 분석', 나�
             "id": c["ticker"],
             "title": c["name"],
             "summary": first,
-            "image": None,
+            "image": LII_THUMB,   # LII는 이미지가 없어 공통 썸네일(LII 소개 문구)을 쓴다 — 와이드(16:9)와 정사각(목록용) 두 벌
+            "image_square": LII_THUMB_SQUARE,
             "url": f"{LII_BASE}/company/{c['ticker']}/ai-view",
             "category": "FUTURE",
             "badge": None,
