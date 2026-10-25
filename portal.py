@@ -37,6 +37,8 @@ ALLOWED_IMAGE_HOSTS = ("storage.googleapis.com", "plants.nemoneai.com", "nemonea
 YOUTUBE_CHANNEL_ID = "UCXQyHkjZNGNWNmm3Tio9Amg"            # https://www.youtube.com/@nemoneaim
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@nemoneaim"
 PODCAST_RSS = "https://anchor.fm/s/10cc660d0/podcast/rss"    # 맛의문명사 | 네모네AIM (애플·스포티파이가 받아 가는 원본 피드)
+PODCAST_COVER = "https://d3t3ozftmdmh3i.cloudfront.net/staging/podcast_uploaded_nologo/44992948/44992948-1786278404565-42a4d35dafd07.jpg"
+PODCAST_COVER_LOCAL = "/portal/podcast-cover.jpg"   # 3000px(1.4MB) 커버를 800px로 줄여 자체 호스팅 — 모든 에피소드가 같은 커버라 이 파일로 대신한다
 PODCAST_URL = "https://podcasts.apple.com/kr/podcast/%EB%A7%9B%EC%9D%98%EB%AC%B8%EB%AA%85%EC%82%AC-%EB%84%A4%EB%AA%A8%EB%84%A4aim/id1861121835"
 BLOG_RSS = "https://rss.blog.naver.com/nemoneaim.xml"
 BLOG_URL = "https://blog.naver.com/nemoneaim"
@@ -290,6 +292,13 @@ def collect_youtube(limit: int = 5) -> dict:
     return {"service": "youtube", "updated_at": datetime.now(KST).isoformat(), "items": items}
 
 
+def _podcast_image(url: Optional[str]) -> Optional[str]:
+    # 커버가 그대로면 자체 호스팅 축소본, 커버가 바뀌었으면(다른 주소) 새 주소를 그대로 쓴다
+    if not url or url == PODCAST_COVER:
+        return PODCAST_COVER_LOCAL
+    return _channel_image(url)
+
+
 def collect_podcast(limit: int = 5) -> dict:
     """맛의문명사 팟캐스트 RSS — 에피소드 제목·이미지·재생 시간. 링크는 RSS의 에피소드 페이지."""
     import xml.etree.ElementTree as ET
@@ -303,7 +312,7 @@ def collect_podcast(limit: int = 5) -> dict:
         dur = (it.findtext("itunes:duration", namespaces=ns) or "").strip()
         items.append({
             "id": (it.findtext("guid") or it.findtext("link") or "")[-40:], "title": _clean(it.findtext("title"), 90),
-            "summary": f"재생 {dur}" if dur else "", "image": _channel_image((im.get("href") if im is not None else None) or show_img),
+            "summary": f"재생 {dur}" if dur else "", "image": _podcast_image((im.get("href") if im is not None else None) or show_img),
             "url": it.findtext("link") or PODCAST_URL, "category": "PODCAST", "badge": None, "tags": [], "published_at": _rfc_to_kst_iso(it.findtext("pubDate")),
         })
     return {"service": "podcast", "updated_at": datetime.now(KST).isoformat(), "items": [x for x in items if x["title"]]}
