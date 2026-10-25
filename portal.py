@@ -547,7 +547,6 @@ def build_today(engine) -> dict:
     ) if p]
 
     used = {(p["items"][i]["service"], p["items"][i]["id"]) for p in discover for i in range(len(p["items"]))}
-    used |= {("aim", a["id"]) for a in aim[:6]}   # 같은 화면 옆의 "네모네 AIM 최신 글"(최신 6개)과 관찰 탭이 겹치지 않게 한다
 
     def mk(pool: list, svc: str, prefix: str, n: int) -> list:
         res = []
